@@ -12,8 +12,12 @@ Module `github.com/kayushkin/job-store`, root package `jobstore`, binary `cmd/jo
 Env: `JOB_STORE_ADDR` (default `:8311`), `JOB_STORE_DATA_DIR` (default `~/.config/job-store`).
 SQLite at `<data dir>/job-store.db`, WAL, `?_foreign_keys=on`.
 
-All timestamps are epoch seconds (`INTEGER`, 0 = unset). Booleans are `INTEGER` 0/1. Arrays are
-JSON-encoded `TEXT`.
+All timestamps are epoch seconds (`INTEGER`, 0 = unset). Arrays are JSON-encoded `TEXT`.
+
+Booleans are `INTEGER` 0/1 **in SQLite** and real JSON booleans **over HTTP** — `remote` and
+`is_default` are stored as `1` and sent as `true`. The storage type is not the wire type; a
+poller sending `"remote": 1` gets a 400, which is the right answer. Read every table below as
+the storage layer.
 
 ---
 

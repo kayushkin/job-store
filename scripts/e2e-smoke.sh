@@ -35,7 +35,11 @@ id_of() { # $1 = json, $2 = array key, $3 = field, $4 = value
 }
 
 echo "==> build"
-go build -o /tmp/job-store-smoke ./cmd/job-store
+# Same tags deploy.sh builds with. Without sqlite_fts5 the binary compiles fine
+# and then dies at migrate time on `no such module: fts5`, so a smoke that
+# omitted the tag would only ever be testing a binary nobody deploys.
+GO_TAGS="${GO_TAGS:-sqlite_fts5}"
+go build -tags "$GO_TAGS" -o /tmp/job-store-smoke ./cmd/job-store
 
 echo "==> start on $PORT (data=$DATA_DIR)"
 JOB_STORE_ADDR=":${PORT}" JOB_STORE_DATA_DIR="$DATA_DIR" /tmp/job-store-smoke &

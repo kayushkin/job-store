@@ -1201,10 +1201,17 @@ func scanDocument(sc scanner) (*Document, error) {
 
 // CreateTailorRequest queues an ask to customize one document for one role.
 //
-// Both ids must resolve to live rows, and the listing must actually carry a
-// description. Tailoring against a job title alone produces exactly the generic
-// letter this feature exists to avoid, so an empty description is refused here
-// rather than discovered later by whoever reads the output.
+// Both ids must resolve to live rows, and the listing must carry a description
+// substantial enough to tailor against. Tailoring against a job title alone
+// produces exactly the generic letter this feature exists to avoid, so a thin
+// description is refused here rather than discovered later by whoever reads the
+// output.
+//
+// The bar is IsThinDescription, the same predicate that flags a listing as
+// description_thin — not merely "not empty". "We are hiring" is thirteen
+// characters and tells a writer nothing, so a guard that only caught the empty
+// string would wave through the exact case it exists to stop, and every such
+// listing is already flagged as incomplete elsewhere in this file.
 func (s *Store) CreateTailorRequest(documentID, listingID int64, instructions string) (*TailorRequest, error) {
 	if documentID <= 0 {
 		return nil, fmt.Errorf("%w: document_id required", ErrInvalidTailorRequest)
@@ -1227,10 +1234,11 @@ func (s *Store) CreateTailorRequest(documentID, listingID int64, instructions st
 		}
 		return nil, err
 	}
-	if strings.TrimSpace(listing.Description) == "" {
+	if IsThinDescription(listing.Description) {
 		return nil, fmt.Errorf(
-			"%w: listing %d has no description to tailor against — fetch the full posting text first (POST /listings with the body, then retry)",
-			ErrInvalidTailorRequest, listingID)
+			"%w: listing %d has only %d characters of description, under the %d needed to tailor against — fetch the full posting text first (POST /listings with the body, then retry)",
+			ErrInvalidTailorRequest, listingID,
+			len(strings.TrimSpace(listing.Description)), ThinDescriptionMinChars)
 	}
 	ts := now()
 	res, err := s.db.Exec(`

@@ -646,6 +646,43 @@ func TestTailorRequestIsRefusedWithoutAJobDescription(t *testing.T) {
 	}
 }
 
+// A description can be present and still be useless. The guard used to test
+// only for the empty string, so a listing whose whole description was "we are
+// hiring" was waved through into the tailoring queue — the exact generic-letter
+// case the refusal exists to prevent. The bar is IsThinDescription, the same
+// predicate that flags the row as description_thin, so the two can never
+// disagree about whether a listing is complete.
+func TestTailorRequestIsRefusedOnAThinDescriptionNotOnlyAnEmptyOne(t *testing.T) {
+	s := openTestStore(t)
+	doc := newTestDocument(t, s, "resume-general", DocumentKindResume)
+	thin, _, err := s.UpsertListing(&Listing{
+		Company:     "Blurb Co",
+		Title:       "Backend Engineer",
+		Description: "we are hiring",
+	})
+	if err != nil {
+		t.Fatalf("create thin listing: %v", err)
+	}
+	if !IsThinDescription(thin.Description) {
+		t.Fatalf("fixture is not thin, so this test proves nothing")
+	}
+
+	if _, err := s.CreateTailorRequest(doc.ID, thin.ID, ""); !errors.Is(err, ErrInvalidTailorRequest) {
+		t.Fatalf("error = %v, want ErrInvalidTailorRequest for a %d-character description",
+			err, len(thin.Description))
+	}
+
+	// And the boundary holds from the other side: once the posting is fetched
+	// in full, the same listing queues without complaint.
+	thin.Description = strings.Repeat("We run Go and Kubernetes on Postgres. ", 10)
+	if _, _, err := s.UpsertListing(thin); err != nil {
+		t.Fatalf("re-poll with the full posting: %v", err)
+	}
+	if _, err := s.CreateTailorRequest(doc.ID, thin.ID, ""); err != nil {
+		t.Fatalf("full description still refused: %v", err)
+	}
+}
+
 func TestTailorRequestIsRefusedOnUnknownIDs(t *testing.T) {
 	s := openTestStore(t)
 	doc := newTestDocument(t, s, "resume-general", DocumentKindResume)
@@ -713,9 +750,14 @@ func TestTailorOverHTTPAnswers202AndRefusesAThinDescriptionWith400(t *testing.T)
 	srv, s := newTestServer(t)
 	doc := newTestDocument(t, s, "resume-general", DocumentKindResume)
 	listing := newTestListing(t, s, "Acme", "Senior Backend Engineer")
-	bare, _, err := s.UpsertListing(&Listing{Company: "Globex", Title: "Backend Engineer"})
+	// Genuinely thin, not empty — the name of this test used to promise thin
+	// coverage while feeding it a listing with no description at all, which is
+	// how a guard that only caught the empty string passed for as long as it did.
+	bare, _, err := s.UpsertListing(&Listing{
+		Company: "Globex", Title: "Backend Engineer", Description: "we are hiring",
+	})
 	if err != nil {
-		t.Fatalf("create bare listing: %v", err)
+		t.Fatalf("create thin listing: %v", err)
 	}
 
 	resp, err := http.Post(srv.URL+"/documents/"+itoa(doc.ID)+"/tailor", "application/json",
@@ -735,7 +777,7 @@ func TestTailorOverHTTPAnswers202AndRefusesAThinDescriptionWith400(t *testing.T)
 	}
 	defer resp2.Body.Close()
 	if resp2.StatusCode != http.StatusBadRequest {
-		t.Errorf("status = %d, want 400 for a listing with no description", resp2.StatusCode)
+		t.Errorf("status = %d, want 400 for a listing whose description is too thin to tailor against", resp2.StatusCode)
 	}
 }
 
