@@ -248,7 +248,7 @@ grep -q 'agent_status' /tmp/job-store-smoke-renamed && grep -q 'stage' /tmp/job-
 
 echo "==> a stage change cannot happen without leaving a trace"
 curl -sfS -X PATCH "$BASE/applications/$AID" -H 'Content-Type: application/json' \
-  -d '{"stage":"submitted","event_note":"applied through the careers page"}' \
+  -d '{"stage":"submitted","note":"applied through the careers page"}' \
   | grep -q '"stage":"submitted"' && pass "stage change accepted" || fail "stage change"
 EVENTS=$(curl -sfS "$BASE/applications/$AID/events")
 [[ "$(count_key "$EVENTS" events)" == "2" ]] \

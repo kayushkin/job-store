@@ -1890,8 +1890,16 @@ func (s *Store) ListApplications(f ApplicationFilter) ([]*Application, error) {
 // ApplicationPatch carries a partial application update. Nil pointers are skipped.
 //
 // Stage is the one field here that writes a second row: changing it appends an
-// ApplicationEvent in the same transaction, and EventNote / EventSource /
+// ApplicationEvent in the same transaction, and Note / EventSource /
 // EventOccurredAt say what to record about the change.
+//
+// Note is spelled `note` on the wire, the same as on POST /applications/{id}/events,
+// because it is the same concept and this decoder is deliberately not strict. It
+// was briefly `event_note` here and `note` there, which meant a caller sending
+// `note` to this route had it dropped in silence — the UI's "recruiter emailed,
+// screen on Tuesday" box wrote nothing and reported success. One name, or an
+// unknown-field check; two names plus a lenient decoder is the combination that
+// loses data quietly.
 type ApplicationPatch struct {
 	Stage       *string `json:"stage"`
 	AgentStatus *string `json:"agent_status"`
@@ -1906,7 +1914,7 @@ type ApplicationPatch struct {
 	AgentSessionID        *string              `json:"agent_session_id"`
 	SubmittedAt           *int64               `json:"submitted_at"`
 	Error                 *string              `json:"error"`
-	EventNote             *string              `json:"event_note"`
+	Note                  *string              `json:"note"`
 	EventSource           *string              `json:"event_source"`
 	EventOccurredAt       *int64               `json:"event_occurred_at"`
 }
@@ -2032,8 +2040,8 @@ func (s *Store) PatchApplication(id int64, p ApplicationPatch) (*Application, er
 			occurredAt = *p.EventOccurredAt
 		}
 		note := ""
-		if p.EventNote != nil {
-			note = *p.EventNote
+		if p.Note != nil {
+			note = *p.Note
 		}
 		if err := appendApplicationEvent(tx, &ApplicationEvent{
 			ApplicationID: id,
@@ -2411,7 +2419,7 @@ func (s *Store) AdvanceApplicationStageFromEmail(emailID int64, stage, note stri
 	source := EventSourceEmail
 	return s.PatchApplication(email.ApplicationID, ApplicationPatch{
 		Stage:           &stage,
-		EventNote:       &note,
+		Note:            &note,
 		EventSource:     &source,
 		EventOccurredAt: &occurredAt,
 	})

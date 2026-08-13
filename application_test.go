@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -79,6 +80,57 @@ func TestUnknownStageAndAgentStatusAreRejected(t *testing.T) {
 		if !strings.Contains(err.Error(), stage) {
 			t.Fatalf("the rejection %q does not name the stage %q", err, stage)
 		}
+	}
+}
+
+// The note on a stage change has to survive the JSON boundary, and that is a
+// different claim from "the store persists a note" — which is why this test
+// speaks HTTP.
+//
+// The field was `event_note` here and `note` on POST /applications/{id}/events.
+// Every store-level test passed, because a Go struct literal does not care what
+// the json tag says. Over the wire, a caller sending `note` — which is what the
+// UI sent, from a box captioned "recruiter emailed, screen on Tuesday" — hit a
+// deliberately lenient decoder, had the field dropped, and got a 200 back. The
+// stage moved and the reason for it was gone.
+//
+// So: one name for one concept, and a test at the layer where the names differ.
+func TestAStageNoteSurvivesTheWireAndIsNotSilentlyDropped(t *testing.T) {
+	srv, s := newTestServer(t)
+	_, app := newTestApplication(t, s)
+
+	const note = "recruiter emailed, screen on Tuesday"
+	req, err := http.NewRequest(http.MethodPatch,
+		fmt.Sprintf("%s/applications/%d", srv.URL, app.ID),
+		strings.NewReader(`{"stage":"screen","note":`+strconv.Quote(note)+`}`))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("patch: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	events, err := s.ListApplicationEvents(app.ID)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	var moved *ApplicationEvent
+	for i := range events {
+		if events[i].StageTo == ApplicationStageScreen {
+			moved = events[i]
+		}
+	}
+	if moved == nil {
+		t.Fatalf("no event recorded the move to screen; events = %+v", events)
+	}
+	if moved.Note != note {
+		t.Errorf("event note = %q, want %q — the note was dropped crossing the wire", moved.Note, note)
 	}
 }
 
@@ -335,7 +387,7 @@ func TestAStageChangeAlwaysLeavesATrace(t *testing.T) {
 
 	submitted := ApplicationStageSubmitted
 	note := "applied through the careers page"
-	if _, err := s.PatchApplication(app.ID, ApplicationPatch{Stage: &submitted, EventNote: &note}); err != nil {
+	if _, err := s.PatchApplication(app.ID, ApplicationPatch{Stage: &submitted, Note: &note}); err != nil {
 		t.Fatalf("patch stage: %v", err)
 	}
 	events, err = s.ListApplicationEvents(app.ID)

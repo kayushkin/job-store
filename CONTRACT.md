@@ -562,7 +562,7 @@ screen before you walk into an interview.
 | GET | `/applications` | `?stage &agent_status &listing_id` → `{"applications":[…]}`, each row carrying `resume_drifted`, `email_count`, `task_count`, `open_task_count`, `last_activity_at`. `?status` is a **400** — it would be ambiguous between the two |
 | POST | `/applications` | upsert by `listing_id`; creating one moves the listing to `applied`. Never writes `stage` |
 | GET | `/applications/{id}` | `?expand=tasks` reads the linked todos through noteboard at request time |
-| PATCH | `/applications/{id}` | `{stage,agent_status,resume_document_id,…,event_note,event_source,event_occurred_at}`. A `stage` change appends its event in the same transaction |
+| PATCH | `/applications/{id}` | `{stage,agent_status,resume_document_id,…,note,event_source,event_occurred_at}`. A `stage` change appends its event in the same transaction |
 | POST | `/applications/{id}/submit` | **501**, phase 3 |
 | DELETE | `/applications/{id}` | hard; takes the timeline, email links and task links with it |
 | GET | `/applications/{id}/events` | `{"events":[…]}`, oldest first |
