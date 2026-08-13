@@ -1,0 +1,15 @@
+[Unit]
+Description=Job Store — job radar: sources, listings, documents and applications
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/kayushkincom/bin/job-store
+Environment=JOB_STORE_ADDR=:8311
+Environment=HOME=/home/kayushkincom
+WorkingDirectory=/home/kayushkincom/repos/job-store
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
