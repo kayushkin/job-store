@@ -2,6 +2,7 @@ package jobstore
 
 import (
 	"crypto/sha1"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -34,6 +35,20 @@ var ErrInvalidDocument = errors.New("invalid document")
 // often a listing_id that resolves to nothing — so the HTTP layer answers 400.
 var ErrInvalidApplication = errors.New("invalid application")
 
+// ErrInvalidApplicationEvent marks a timeline entry the caller described wrongly
+// — a note with no text, an unknown source, or an attempt to record a stage
+// change here instead of making one.
+var ErrInvalidApplicationEvent = errors.New("invalid application event")
+
+// ErrInvalidApplicationEmail marks an email link the caller described wrongly —
+// a missing mailstack id, an unknown status or direction, or a proposed link
+// being asked to do something only a confirmed one may do.
+var ErrInvalidApplicationEmail = errors.New("invalid application email")
+
+// ErrInvalidApplicationTask marks a task link the caller described wrongly, most
+// often a missing noteboard id.
+var ErrInvalidApplicationTask = errors.New("invalid application task")
+
 // ErrInvalidTailorRequest marks a tailor request the caller described wrongly —
 // an unknown document or listing, or a listing with no description to tailor
 // against — so the HTTP layer answers 400.
@@ -43,6 +58,17 @@ var ErrInvalidTailorRequest = errors.New("invalid tailor request")
 type Store struct {
 	db      *sql.DB
 	dataDir string
+	// noteboard is how application tasks are read and created. noteboard owns
+	// them; this store only ever holds their ids.
+	noteboard *NoteboardClient
+}
+
+// SetNoteboardBaseURL points this store's task reads and creates at another
+// noteboard. It exists so a test can aim the store at a stub — or at an address
+// nothing answers on, to prove an unreachable noteboard is reported rather than
+// read as "no outstanding tasks".
+func (s *Store) SetNoteboardBaseURL(baseURL string) {
+	s.noteboard = NewNoteboardClient(baseURL)
 }
 
 // DefaultDataDir is where the DB lives when JOB_STORE_DATA_DIR is unset.
@@ -87,11 +113,21 @@ func Open(dataDir string) (*Store, error) {
 		}
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
-	s := &Store{db: db, dataDir: dataDir}
+	s := &Store{db: db, dataDir: dataDir, noteboard: NewNoteboardClient("")}
+	// applications.status became applications.agent_status. The rename runs before
+	// the column pass below because the stage backfill reads agent_status, and it
+	// renames in place rather than adding a column and copying: an ALTER ... RENAME
+	// COLUMN keeps every existing value, and a live database with real applications
+	// in it must not lose what the automation had already recorded.
+	if err := s.ensureRenamedColumn("applications", "status", "agent_status"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("rename applications.status: %w", err)
+	}
 	// schema.sql only creates tables that do not exist yet, so a column added to a
 	// table already present on a running host has to be added here. Every entry is
 	// idempotent: ensureColumn is a no-op when the column is already there, which
 	// is the case for a database created from the current schema.sql.
+	addedColumn := map[string]bool{}
 	for _, col := range []struct{ table, column, ddl string }{
 		{"listings", "deleted_at", `deleted_at INTEGER NOT NULL DEFAULT 0`},
 		{"listings", "apply_url", `apply_url TEXT NOT NULL DEFAULT ''`},
@@ -105,10 +141,36 @@ func Open(dataDir string) (*Store, error) {
 		{"documents", "extracted_at", `extracted_at INTEGER NOT NULL DEFAULT 0`},
 		{"documents", "derived_from_document_id", `derived_from_document_id INTEGER NOT NULL DEFAULT 0`},
 		{"documents", "listing_id", `listing_id INTEGER NOT NULL DEFAULT 0`},
+		{"applications", "agent_status", `agent_status TEXT NOT NULL DEFAULT 'draft'`},
+		{"applications", "stage", `stage TEXT NOT NULL DEFAULT 'drafting'`},
+		{"applications", "resume_body_sha256", `resume_body_sha256 TEXT NOT NULL DEFAULT ''`},
 	} {
-		if err := s.ensureColumn(col.table, col.column, col.ddl); err != nil {
+		added, err := s.ensureColumn(col.table, col.column, col.ddl)
+		if err != nil {
 			db.Close()
 			return nil, fmt.Errorf("add %s.%s: %w", col.table, col.column, err)
+		}
+		addedColumn[col.table+"."+col.column] = added
+	}
+	// A row that predates `stage` still has an agent_status, and for two of its
+	// four values the employer-facing stage is not a guess: an application the
+	// automation submitted really is submitted, and one it had marked ready really
+	// is ready. The other two mean nothing was ever sent, which is the `drafting`
+	// default the column already carries. This runs once, only in the migration
+	// that adds the column, so it can never overwrite a stage someone has since set.
+	if addedColumn["applications.stage"] {
+		res, err := db.Exec(`
+			UPDATE applications SET stage = CASE agent_status WHEN ? THEN ? WHEN ? THEN ? END
+			WHERE agent_status IN (?, ?)`,
+			ApplicationAgentStatusSubmitted, ApplicationStageSubmitted,
+			ApplicationAgentStatusReady, ApplicationStageReady,
+			ApplicationAgentStatusSubmitted, ApplicationAgentStatusReady)
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("backfill applications.stage: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			log.Printf("[job-store] schema: backfilled applications.stage for %d row(s) from agent_status", n)
 		}
 	}
 	// Indexes naming a column added above have to be created after that column
@@ -127,31 +189,69 @@ func Open(dataDir string) (*Store, error) {
 	return s, nil
 }
 
-// ensureColumn adds a column when the table does not already have it. SQLite has
-// no "ADD COLUMN IF NOT EXISTS", so the presence check is a table_info scan.
-func (s *Store) ensureColumn(table, column, ddl string) error {
-	rows, err := s.db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+// ensureColumn adds a column when the table does not already have it, and reports
+// whether it added one — a migration that has to backfill the new column needs to
+// know it is running for the first time. SQLite has no "ADD COLUMN IF NOT
+// EXISTS", so the presence check is a table_info scan.
+func (s *Store) ensureColumn(table, column, ddl string) (bool, error) {
+	columns, err := s.columnNames(table)
+	if err != nil {
+		return false, err
+	}
+	if columns[column] {
+		return false, nil
+	}
+	if _, err := s.db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + ddl); err != nil {
+		return false, err
+	}
+	log.Printf("[job-store] schema: added %s.%s", table, column)
+	return true, nil
+}
+
+// ensureRenamedColumn renames a column that still carries its old name, and is a
+// no-op once the new name is in place — so it is safe to run on every boot.
+//
+// Renaming in place is the point: it keeps every value the old column held, where
+// adding the new column and leaving the old one behind would give the same fact
+// two homes and let them disagree. A table that has neither name yet is left to
+// the ensureColumn pass; a table that somehow has BOTH is refused rather than
+// guessed at, because picking one would silently discard whatever is in the other.
+func (s *Store) ensureRenamedColumn(table, from, to string) error {
+	columns, err := s.columnNames(table)
 	if err != nil {
 		return err
 	}
+	switch {
+	case columns[to] && columns[from]:
+		return fmt.Errorf("%s has both %s and %s: two homes for one fact, and this "+
+			"migration will not choose between them — merge them by hand", table, from, to)
+	case columns[to], !columns[from]:
+		return nil
+	}
+	if _, err := s.db.Exec(`ALTER TABLE ` + table + ` RENAME COLUMN ` + from + ` TO ` + to); err != nil {
+		return err
+	}
+	log.Printf("[job-store] schema: renamed %s.%s to %s.%s", table, from, table, to)
+	return nil
+}
+
+// columnNames reads the column names of a table as a set, or an empty set when
+// the table does not exist.
+func (s *Store) columnNames(table string) (map[string]bool, error) {
+	rows, err := s.db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
+	columns := map[string]bool{}
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
-			return err
+			return nil, err
 		}
-		if name == column {
-			return nil
-		}
+		columns[name] = true
 	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	_, err = s.db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + ddl)
-	if err == nil {
-		log.Printf("[job-store] schema: added %s.%s", table, column)
-	}
-	return err
+	return columns, rows.Err()
 }
 
 // Close closes the database.
@@ -512,6 +612,25 @@ func (s *Store) PatchListing(id int64, p ListingPatch) (*Listing, error) {
 		if !ValidListingStatus(*p.Status) {
 			return nil, fmt.Errorf("%w: unknown status %q: use one of %s",
 				ErrInvalidListing, *p.Status, strings.Join(ListingStatuses, ", "))
+		}
+		// Once an application exists, the listing's status has handed the pipeline
+		// over: creating the application moved it to `applied` and it never moves
+		// again. Refusing here is what makes that true rather than merely stated —
+		// two fields answering "where is this" would otherwise answer differently,
+		// and the one that is right is the application's stage.
+		var applicationID int64
+		var stage string
+		err := s.db.QueryRow(`SELECT id, stage FROM applications WHERE listing_id=?`, id).
+			Scan(&applicationID, &stage)
+		switch {
+		case err == nil:
+			return nil, fmt.Errorf("%w: listing %d has application %d, which is at stage %q: "+
+				"the listing status stopped being the pipeline when the application was created. "+
+				"Move the application instead: PATCH /applications/%d {\"stage\":…}",
+				ErrInvalidListing, id, applicationID, stage, applicationID)
+		case errors.Is(err, sql.ErrNoRows):
+		default:
+			return nil, err
 		}
 		sets = append(sets, "status=?")
 		args = append(args, *p.Status)
@@ -1406,6 +1525,17 @@ func scanTailorRequest(sc scanner) (*TailorRequest, error) {
 // applying to a specific posting, and one pointing at a listing that does not
 // exist is not a record of anything. Rejecting it here is what keeps the join on
 // ids honest.
+//
+// Creating one moves its listing to `applied` in the same transaction, and the
+// listing's status stops being the pipeline from then on — from that moment
+// `stage` is where you stand, and two fields answering the same question would
+// give it two answers.
+//
+// The update path deliberately never writes `stage`. A re-post of an application
+// is the automation refreshing what it has; where you stand with the employer is
+// a decision, and PATCH is its only channel — which is also what keeps "no stage
+// change without an event" true by construction rather than by everyone
+// remembering.
 func (s *Store) UpsertApplication(a *Application) (*Application, bool, error) {
 	if a.ListingID <= 0 {
 		return nil, false, fmt.Errorf("%w: listing_id required", ErrInvalidApplication)
@@ -1417,71 +1547,310 @@ func (s *Store) UpsertApplication(a *Application) (*Application, bool, error) {
 		}
 		return nil, false, err
 	}
-	if a.Status == "" {
-		a.Status = ApplicationStatusDraft
+	if a.AgentStatus == "" {
+		a.AgentStatus = ApplicationAgentStatusDraft
 	}
-	if !ValidApplicationStatus(a.Status) {
-		return nil, false, fmt.Errorf("%w: unknown status %q: use one of %s",
-			ErrInvalidApplication, a.Status, strings.Join(ApplicationStatuses, ", "))
+	if !ValidApplicationAgentStatus(a.AgentStatus) {
+		return nil, false, fmt.Errorf("%w: unknown agent_status %q: use one of %s",
+			ErrInvalidApplication, a.AgentStatus, strings.Join(ApplicationAgentStatuses, ", "))
+	}
+	if a.Stage == "" {
+		a.Stage = ApplicationStageDrafting
+	}
+	if !ValidApplicationStage(a.Stage) {
+		return nil, false, fmt.Errorf("%w: unknown stage %q: use one of %s",
+			ErrInvalidApplication, a.Stage, strings.Join(ApplicationStages, ", "))
 	}
 	ts := now()
 
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.Rollback()
+
 	var existingID int64
-	err := s.db.QueryRow(`SELECT id FROM applications WHERE listing_id=?`, a.ListingID).Scan(&existingID)
+	var existingAgentStatus, existingPin string
+	err = tx.QueryRow(`SELECT id, agent_status, resume_body_sha256 FROM applications WHERE listing_id=?`,
+		a.ListingID).Scan(&existingID, &existingAgentStatus, &existingPin)
+	created := false
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		res, err := s.db.Exec(`
+		pin := ""
+		if a.AgentStatus == ApplicationAgentStatusSubmitted {
+			pin, err = pinResumeBody(tx, a.ResumeDocumentID,
+				fmt.Sprintf("the new application for listing %d", a.ListingID))
+			if err != nil {
+				return nil, false, err
+			}
+		}
+		res, err := tx.Exec(`
 			INSERT INTO applications
-			  (listing_id, status, resume_document_id, cover_letter_document_id,
-			   cover_letter_body, answers, agent_session_id, submitted_at, error,
-			   created_at, updated_at)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-			a.ListingID, a.Status, a.ResumeDocumentID, a.CoverLetterDocumentID,
-			a.CoverLetterBody, marshalAnswers(a.Answers), a.AgentSessionID, a.SubmittedAt,
-			a.Error, ts, ts)
+			  (listing_id, stage, agent_status, resume_document_id, resume_body_sha256,
+			   cover_letter_document_id, cover_letter_body, answers, agent_session_id,
+			   submitted_at, error, created_at, updated_at)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			a.ListingID, a.Stage, a.AgentStatus, a.ResumeDocumentID, pin,
+			a.CoverLetterDocumentID, a.CoverLetterBody, marshalAnswers(a.Answers),
+			a.AgentSessionID, a.SubmittedAt, a.Error, ts, ts)
 		if err != nil {
 			return nil, false, err
 		}
-		id, _ := res.LastInsertId()
-		got, err := s.GetApplication(id)
-		return got, true, err
+		existingID, _ = res.LastInsertId()
+		created = true
+		// The application starts its own timeline, so the stage it starts in is a
+		// recorded event like every stage after it rather than a value that was
+		// simply always there.
+		if err := appendApplicationEvent(tx, &ApplicationEvent{
+			ApplicationID: existingID,
+			StageTo:       a.Stage,
+			Note:          "application created",
+			Source:        EventSourceUser,
+			OccurredAt:    ts,
+		}); err != nil {
+			return nil, false, err
+		}
+		// The listing's own status hands the pipeline over here.
+		if _, err := tx.Exec(`UPDATE listings SET status=?, updated_at=? WHERE id=? AND deleted_at=0`,
+			ListingStatusApplied, ts, a.ListingID); err != nil {
+			return nil, false, err
+		}
 	case err != nil:
 		return nil, false, err
 	default:
-		_, err := s.db.Exec(`
+		pin := existingPin
+		if a.AgentStatus == ApplicationAgentStatusSubmitted && existingPin == "" {
+			pin, err = pinResumeBody(tx, a.ResumeDocumentID,
+				fmt.Sprintf("application %d", existingID))
+			if err != nil {
+				return nil, false, err
+			}
+		}
+		if _, err := tx.Exec(`
 			UPDATE applications SET
-			  status=?, resume_document_id=?, cover_letter_document_id=?, cover_letter_body=?,
-			  answers=?, agent_session_id=?, submitted_at=?, error=?, updated_at=?
+			  agent_status=?, resume_document_id=?, resume_body_sha256=?,
+			  cover_letter_document_id=?, cover_letter_body=?, answers=?, agent_session_id=?,
+			  submitted_at=?, error=?, updated_at=?
 			WHERE id=?`,
-			a.Status, a.ResumeDocumentID, a.CoverLetterDocumentID, a.CoverLetterBody,
-			marshalAnswers(a.Answers), a.AgentSessionID, a.SubmittedAt, a.Error, ts, existingID)
-		if err != nil {
+			a.AgentStatus, a.ResumeDocumentID, pin, a.CoverLetterDocumentID, a.CoverLetterBody,
+			marshalAnswers(a.Answers), a.AgentSessionID, a.SubmittedAt, a.Error, ts,
+			existingID); err != nil {
 			return nil, false, err
 		}
-		got, err := s.GetApplication(existingID)
-		return got, false, err
 	}
+	if err := tx.Commit(); err != nil {
+		return nil, false, err
+	}
+	got, err := s.GetApplication(existingID)
+	return got, created, err
+}
+
+// pinResumeBody hashes the body of the resume an application is being submitted
+// with, so the record says which VERSION was sent and not merely which file.
+//
+// An application submitted without naming a resume pins nothing — there is no
+// content to hash, and a hash of the empty string would claim an empty resume was
+// sent. That is logged rather than passed over in silence. A resume id naming no
+// document is the caller's mistake and is refused.
+func pinResumeBody(tx *sql.Tx, resumeDocumentID int64, describedAs string) (string, error) {
+	if resumeDocumentID == 0 {
+		log.Printf("[job-store] %s reached %q with no resume_document_id: nothing to pin",
+			describedAs, ApplicationAgentStatusSubmitted)
+		return "", nil
+	}
+	var body string
+	err := tx.QueryRow(`SELECT body FROM documents WHERE id=?`, resumeDocumentID).Scan(&body)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("%w: resume_document_id %d does not name a document, so there is "+
+			"nothing to pin as the copy that was sent", ErrInvalidApplication, resumeDocumentID)
+	}
+	if err != nil {
+		return "", err
+	}
+	return sha256Hex(body), nil
+}
+
+// sha256Hex is the content hash used to pin a submitted resume.
+func sha256Hex(body string) string {
+	sum := sha256.Sum256([]byte(body))
+	return fmt.Sprintf("%x", sum)
 }
 
 // GetApplication fetches one application by id.
 func (s *Store) GetApplication(id int64) (*Application, error) {
 	row := s.db.QueryRow(applicationCols+` FROM applications WHERE id=?`, id)
-	return scanApplication(row)
+	a, err := scanApplication(row)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.deriveResumeDrift(a); err != nil {
+		return nil, err
+	}
+	if err := s.deriveApplicationCounts([]*Application{a}); err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
+// deriveApplicationCounts fills in the summary numbers a caller would otherwise
+// have to make three more requests to compute. All of it comes from this
+// database, so it costs no network call and cannot fail because another service
+// is down — the one number that does need noteboard, OpenTaskCount, is left to
+// CountOpenApplicationTasks.
+//
+// LastActivityAt reads from the timeline and the confirmed mail, never from
+// updated_at: an agent retrying a write is not a company writing back, and this
+// number is what a "quiet for N days" column is measured from. A proposed email
+// is not activity either — it is a guess nobody has accepted yet.
+func (s *Store) deriveApplicationCounts(apps []*Application) error {
+	if len(apps) == 0 {
+		return nil
+	}
+	byID := make(map[int64]*Application, len(apps))
+	for _, a := range apps {
+		byID[a.ID] = a
+		a.EmailCount = 0
+		a.TaskCount = 0
+		a.LastActivityAt = 0
+	}
+	scanCounts := func(query string, args []any, assign func(a *Application, n int64)) error {
+		rows, err := s.db.Query(query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var applicationID, value int64
+			if err := rows.Scan(&applicationID, &value); err != nil {
+				return err
+			}
+			if a, ok := byID[applicationID]; ok {
+				assign(a, value)
+			}
+		}
+		return rows.Err()
+	}
+	if err := scanCounts(
+		`SELECT application_id, COUNT(*) FROM application_emails WHERE status=? GROUP BY application_id`,
+		[]any{EmailLinkStatusLinked},
+		func(a *Application, n int64) { a.EmailCount = int(n) }); err != nil {
+		return err
+	}
+	if err := scanCounts(
+		`SELECT application_id, COUNT(*) FROM application_tasks GROUP BY application_id`,
+		nil,
+		func(a *Application, n int64) { a.TaskCount = int(n) }); err != nil {
+		return err
+	}
+	return scanCounts(`
+		SELECT application_id, MAX(occurred_at) FROM (
+			SELECT application_id, occurred_at FROM application_events
+			UNION ALL
+			SELECT application_id, occurred_at FROM application_emails WHERE status=?
+		) GROUP BY application_id`,
+		[]any{EmailLinkStatusLinked},
+		func(a *Application, n int64) { a.LastActivityAt = n })
+}
+
+// CountOpenApplicationTasks fills in OpenTaskCount for each application, reading
+// noteboard once for the whole set rather than once per linked todo.
+//
+// A noteboard that cannot be read leaves every count nil and returns the reason.
+// nil means "could not tell"; it never collapses into 0, which would read as
+// "nothing outstanding" — the same lie the task expansion refuses to tell.
+func (s *Store) CountOpenApplicationTasks(apps []*Application) error {
+	if len(apps) == 0 {
+		return nil
+	}
+	linked := false
+	for _, a := range apps {
+		if a.TaskCount > 0 {
+			linked = true
+		}
+	}
+	if !linked {
+		// Nothing is linked anywhere, so the answer is zero without asking.
+		for _, a := range apps {
+			zero := 0
+			a.OpenTaskCount = &zero
+		}
+		return nil
+	}
+	open, err := s.noteboard.OpenTodoIDs()
+	if err != nil {
+		// Clear every count rather than leaving whatever a previous read put there:
+		// a stale number is the one answer worse than "could not tell".
+		for _, a := range apps {
+			a.OpenTaskCount = nil
+		}
+		return err
+	}
+	for _, a := range apps {
+		links, err := s.ListApplicationTasks(a.ID)
+		if err != nil {
+			return err
+		}
+		count := 0
+		for _, link := range links {
+			if open[link.NoteboardID] {
+				count++
+			}
+		}
+		openCount := count
+		a.OpenTaskCount = &openCount
+	}
+	return nil
+}
+
+// deriveResumeDrift reports on the application whether the resume document's
+// current body still hashes to what was pinned at submission. Derived on every
+// read and never stored, so it cannot disagree with the document it describes.
+//
+// A pinned resume whose document has since been deleted counts as drifted: the
+// copy the employer holds is provably not the copy on this machine, which is
+// exactly what the flag exists to say.
+func (s *Store) deriveResumeDrift(a *Application) error {
+	if a.ResumeBodySHA256 == "" {
+		return nil
+	}
+	if a.ResumeDocumentID == 0 {
+		a.ResumeDrifted = true
+		return nil
+	}
+	var body string
+	err := s.db.QueryRow(`SELECT body FROM documents WHERE id=?`, a.ResumeDocumentID).Scan(&body)
+	if errors.Is(err, sql.ErrNoRows) {
+		a.ResumeDrifted = true
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	a.ResumeDrifted = sha256Hex(body) != a.ResumeBodySHA256
+	return nil
 }
 
 // ApplicationFilter narrows ListApplications.
 type ApplicationFilter struct {
-	Status    string
-	ListingID int64
+	// Stage is where you stand with the employer; AgentStatus is what the
+	// automation has done. They are separate filters because they answer separate
+	// questions — "what is still live" and "what did the agent fail on".
+	Stage       string
+	AgentStatus string
+	ListingID   int64
 }
 
 // ListApplications returns applications matching the filter, newest first.
 func (s *Store) ListApplications(f ApplicationFilter) ([]*Application, error) {
 	q := applicationCols + ` FROM applications WHERE 1=1`
 	var args []any
-	if f.Status != "" {
-		q += ` AND status=?`
-		args = append(args, f.Status)
+	if f.Stage != "" {
+		q += ` AND stage=?`
+		args = append(args, f.Stage)
+	}
+	if f.AgentStatus != "" {
+		q += ` AND agent_status=?`
+		args = append(args, f.AgentStatus)
 	}
 	if f.ListingID != 0 {
 		q += ` AND listing_id=?`
@@ -1501,11 +1870,34 @@ func (s *Store) ListApplications(f ApplicationFilter) ([]*Application, error) {
 		}
 		out = append(out, a)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// The list reports drift and the summary numbers the same way a single read
+	// does. A board that showed no drift while the detail view showed it would be
+	// the more convincing of the two lies.
+	for _, a := range out {
+		if err := s.deriveResumeDrift(a); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.deriveApplicationCounts(out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // ApplicationPatch carries a partial application update. Nil pointers are skipped.
+//
+// Stage is the one field here that writes a second row: changing it appends an
+// ApplicationEvent in the same transaction, and EventNote / EventSource /
+// EventOccurredAt say what to record about the change.
 type ApplicationPatch struct {
+	Stage       *string `json:"stage"`
+	AgentStatus *string `json:"agent_status"`
+	// Status is the name agent_status used to carry, kept only so a caller still
+	// sending it is told rather than silently ignored — the two fields it could
+	// now mean are not interchangeable, so this store will not choose one.
 	Status                *string              `json:"status"`
 	ResumeDocumentID      *int64               `json:"resume_document_id"`
 	CoverLetterDocumentID *int64               `json:"cover_letter_document_id"`
@@ -1514,21 +1906,72 @@ type ApplicationPatch struct {
 	AgentSessionID        *string              `json:"agent_session_id"`
 	SubmittedAt           *int64               `json:"submitted_at"`
 	Error                 *string              `json:"error"`
+	EventNote             *string              `json:"event_note"`
+	EventSource           *string              `json:"event_source"`
+	EventOccurredAt       *int64               `json:"event_occurred_at"`
+}
+
+// ErrStatusRenamed is what a caller still sending the old `status` field gets
+// back. It names both replacements rather than picking one, because an agent
+// failing to fill a form and a company rejecting you were exactly the two things
+// that field used to conflate.
+func ErrStatusRenamed() error {
+	return fmt.Errorf("%w: `status` no longer exists on an application: send `agent_status` "+
+		"(%s) for what the automation did, or `stage` (%s) for where you stand with the employer",
+		ErrInvalidApplication, strings.Join(ApplicationAgentStatuses, "|"),
+		strings.Join(ApplicationStages, "|"))
 }
 
 // PatchApplication applies a partial update and returns the fresh row.
+//
+// A change of stage appends its event inside the same transaction as the change
+// itself. That is the whole safety property of this function: if the event cannot
+// be written the stage does not move either, so the timeline can never be missing
+// a step that happened.
 func (s *Store) PatchApplication(id int64, p ApplicationPatch) (*Application, error) {
+	if p.Status != nil {
+		return nil, ErrStatusRenamed()
+	}
+	existing, err := s.GetApplication(id)
+	if err != nil {
+		return nil, err
+	}
+	eventSource := EventSourceUser
+	if p.EventSource != nil {
+		if !ValidEventSource(*p.EventSource) {
+			return nil, fmt.Errorf("%w: unknown event_source %q: use one of %s",
+				ErrInvalidApplicationEvent, *p.EventSource, strings.Join(EventSources, ", "))
+		}
+		eventSource = *p.EventSource
+	}
 	var sets []string
 	var args []any
-	if p.Status != nil {
-		if !ValidApplicationStatus(*p.Status) {
-			return nil, fmt.Errorf("%w: unknown status %q: use one of %s",
-				ErrInvalidApplication, *p.Status, strings.Join(ApplicationStatuses, ", "))
+	stageChanged := false
+	if p.Stage != nil {
+		if !ValidApplicationStage(*p.Stage) {
+			return nil, fmt.Errorf("%w: unknown stage %q: use one of %s",
+				ErrInvalidApplication, *p.Stage, strings.Join(ApplicationStages, ", "))
 		}
-		sets = append(sets, "status=?")
-		args = append(args, *p.Status)
+		stageChanged = *p.Stage != existing.Stage
+		sets = append(sets, "stage=?")
+		args = append(args, *p.Stage)
 	}
+	pinResume := false
+	if p.AgentStatus != nil {
+		if !ValidApplicationAgentStatus(*p.AgentStatus) {
+			return nil, fmt.Errorf("%w: unknown agent_status %q: use one of %s",
+				ErrInvalidApplication, *p.AgentStatus, strings.Join(ApplicationAgentStatuses, ", "))
+		}
+		// The pin is written the first time the automation reports the application
+		// submitted, and never again: it records what was actually sent, and a later
+		// rewrite would quietly restate history as whatever the resume says today.
+		pinResume = *p.AgentStatus == ApplicationAgentStatusSubmitted && existing.ResumeBodySHA256 == ""
+		sets = append(sets, "agent_status=?")
+		args = append(args, *p.AgentStatus)
+	}
+	resumeDocumentID := existing.ResumeDocumentID
 	if p.ResumeDocumentID != nil {
+		resumeDocumentID = *p.ResumeDocumentID
 		sets = append(sets, "resume_document_id=?")
 		args = append(args, *p.ResumeDocumentID)
 	}
@@ -1557,23 +2000,374 @@ func (s *Store) PatchApplication(id int64, p ApplicationPatch) (*Application, er
 		args = append(args, *p.Error)
 	}
 	if len(sets) == 0 {
-		return s.GetApplication(id)
+		return existing, nil
 	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if pinResume {
+		pin, err := pinResumeBody(tx, resumeDocumentID, fmt.Sprintf("application %d", id))
+		if err != nil {
+			return nil, err
+		}
+		sets = append(sets, "resume_body_sha256=?")
+		args = append(args, pin)
+	}
+	ts := now()
 	sets = append(sets, "updated_at=?")
-	args = append(args, now(), id)
-	res, err := s.db.Exec(`UPDATE applications SET `+strings.Join(sets, ", ")+` WHERE id=?`, args...)
+	args = append(args, ts, id)
+	res, err := tx.Exec(`UPDATE applications SET `+strings.Join(sets, ", ")+` WHERE id=?`, args...)
 	if err != nil {
 		return nil, err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return nil, ErrNotFound
 	}
+	if stageChanged {
+		occurredAt := ts
+		if p.EventOccurredAt != nil && *p.EventOccurredAt > 0 {
+			occurredAt = *p.EventOccurredAt
+		}
+		note := ""
+		if p.EventNote != nil {
+			note = *p.EventNote
+		}
+		if err := appendApplicationEvent(tx, &ApplicationEvent{
+			ApplicationID: id,
+			StageFrom:     existing.Stage,
+			StageTo:       *p.Stage,
+			Note:          note,
+			Source:        eventSource,
+			OccurredAt:    occurredAt,
+		}); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
 	return s.GetApplication(id)
 }
 
-// DeleteApplication removes an application.
+// DeleteApplication removes an application, along with its timeline, its email
+// links and its task links — those three rows describe this application and
+// nothing else, and leaving them behind would leave a timeline for a record that
+// no longer exists.
+//
+// The noteboard todos themselves are left alone: noteboard owns them, and "I
+// deleted the application" is not "the follow-up no longer needs doing".
 func (s *Store) DeleteApplication(id int64) error {
-	res, err := s.db.Exec(`DELETE FROM applications WHERE id=?`, id)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`DELETE FROM applications WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	for _, table := range []string{"application_events", "application_emails", "application_tasks"} {
+		if _, err := tx.Exec(`DELETE FROM `+table+` WHERE application_id=?`, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+const applicationCols = `SELECT id, listing_id, stage, agent_status, resume_document_id,
+	resume_body_sha256, cover_letter_document_id, cover_letter_body, answers, agent_session_id,
+	submitted_at, error, created_at, updated_at`
+
+func scanApplication(sc scanner) (*Application, error) {
+	var a Application
+	var answers string
+	err := sc.Scan(&a.ID, &a.ListingID, &a.Stage, &a.AgentStatus, &a.ResumeDocumentID,
+		&a.ResumeBodySHA256, &a.CoverLetterDocumentID, &a.CoverLetterBody, &answers,
+		&a.AgentSessionID, &a.SubmittedAt, &a.Error, &a.CreatedAt, &a.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	a.Answers = unmarshalAnswers(answers)
+	return &a, nil
+}
+
+// ---- Application events ----
+
+// appendApplicationEvent writes one timeline entry on the transaction it is given.
+// It takes a *sql.Tx rather than opening its own, because every caller that
+// changes a stage has to write the change and its event together or neither.
+func appendApplicationEvent(tx *sql.Tx, e *ApplicationEvent) error {
+	if e.Source == "" {
+		e.Source = EventSourceUser
+	}
+	if e.OccurredAt == 0 {
+		e.OccurredAt = now()
+	}
+	_, err := tx.Exec(`
+		INSERT INTO application_events
+		  (application_id, stage_from, stage_to, note, source, occurred_at, created_at)
+		VALUES (?,?,?,?,?,?,?)`,
+		e.ApplicationID, e.StageFrom, e.StageTo, e.Note, e.Source, e.OccurredAt, now())
+	return err
+}
+
+// RecordApplicationEvent appends a note to an application's timeline: something
+// that happened without moving the stage — a recruiter called, a referral went
+// in, a take-home landed.
+//
+// It cannot record a stage change. A stage moves through PatchApplication, which
+// writes the change and its event together; letting this route write a stage_to
+// as well would allow a timeline that says an application advanced while the
+// application says it did not.
+func (s *Store) RecordApplicationEvent(applicationID int64, e ApplicationEvent) (*ApplicationEvent, error) {
+	if _, err := s.GetApplication(applicationID); err != nil {
+		return nil, err
+	}
+	if e.StageFrom != "" || e.StageTo != "" {
+		return nil, fmt.Errorf("%w: this route records a note, not a stage change: move the stage "+
+			"with PATCH /applications/%d {\"stage\":…} and it appends the event itself",
+			ErrInvalidApplicationEvent, applicationID)
+	}
+	if strings.TrimSpace(e.Note) == "" {
+		return nil, fmt.Errorf("%w: note required: an event with no stage change and no note "+
+			"records nothing", ErrInvalidApplicationEvent)
+	}
+	if e.Source == "" {
+		e.Source = EventSourceUser
+	}
+	if !ValidEventSource(e.Source) {
+		return nil, fmt.Errorf("%w: unknown source %q: use one of %s",
+			ErrInvalidApplicationEvent, e.Source, strings.Join(EventSources, ", "))
+	}
+	e.ApplicationID = applicationID
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if err := appendApplicationEvent(tx, &e); err != nil {
+		return nil, err
+	}
+	var id int64
+	if err := tx.QueryRow(`SELECT last_insert_rowid()`).Scan(&id); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return s.GetApplicationEvent(id)
+}
+
+// GetApplicationEvent fetches one timeline entry by id.
+func (s *Store) GetApplicationEvent(id int64) (*ApplicationEvent, error) {
+	row := s.db.QueryRow(applicationEventCols+` FROM application_events WHERE id=?`, id)
+	return scanApplicationEvent(row)
+}
+
+// ListApplicationEvents returns an application's timeline, oldest first — the
+// order the events happened in, which is the order the question "how long have
+// they been silent" is read in.
+func (s *Store) ListApplicationEvents(applicationID int64) ([]*ApplicationEvent, error) {
+	rows, err := s.db.Query(applicationEventCols+
+		` FROM application_events WHERE application_id=? ORDER BY occurred_at ASC, id ASC`,
+		applicationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*ApplicationEvent
+	for rows.Next() {
+		e, err := scanApplicationEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+const applicationEventCols = `SELECT id, application_id, stage_from, stage_to, note, source,
+	occurred_at, created_at`
+
+func scanApplicationEvent(sc scanner) (*ApplicationEvent, error) {
+	var e ApplicationEvent
+	err := sc.Scan(&e.ID, &e.ApplicationID, &e.StageFrom, &e.StageTo, &e.Note, &e.Source,
+		&e.OccurredAt, &e.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &e, nil
+}
+
+// ---- Application emails ----
+
+// LinkApplicationEmail joins an application to one message in mailstack, keyed by
+// (application_id, account_id, message_id) — mailstack's own per-account id,
+// which is always present. The RFC 5322 Message-ID is carried alongside for
+// cross-account dedup and is never the key: mailstack's own source says it is
+// optional per §3.6.4 and that no caller may key on it blindly.
+//
+// A matcher may only propose. Guessing that an email from a company domain
+// belongs to a given application is exactly the guess that files a rejection
+// under the wrong job, so a matcher asking for anything but `proposed` is
+// refused rather than quietly downgraded — it should learn that it cannot
+// self-approve.
+//
+// Re-posting the same message refreshes what it says and never `status` or
+// `linked_by`: a matcher re-running must not undo a confirmation or a rejection.
+func (s *Store) LinkApplicationEmail(applicationID int64, e *ApplicationEmail) (*ApplicationEmail, bool, error) {
+	if _, err := s.GetApplication(applicationID); err != nil {
+		return nil, false, err
+	}
+	e.AccountID = strings.TrimSpace(e.AccountID)
+	e.MessageID = strings.TrimSpace(e.MessageID)
+	if e.AccountID == "" || e.MessageID == "" {
+		return nil, false, fmt.Errorf("%w: account_id and message_id are both required: they are "+
+			"mailstack's own per-account id and the only key this join has. rfc_message_id is "+
+			"optional per RFC 5322 §3.6.4 and cannot stand in for it", ErrInvalidApplicationEmail)
+	}
+	// Brackets stripped, the same normalization mailstack applies, so the value
+	// stored here compares equal to the one mailstack serves.
+	e.RFCMessageID = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(
+		strings.TrimSpace(e.RFCMessageID), "<"), ">"))
+	if e.LinkedBy == "" {
+		e.LinkedBy = EmailLinkedByUser
+	}
+	if !ValidEmailLinker(e.LinkedBy) {
+		return nil, false, fmt.Errorf("%w: unknown linked_by %q: use one of %s",
+			ErrInvalidApplicationEmail, e.LinkedBy, strings.Join(EmailLinkers, ", "))
+	}
+	if e.Direction == "" {
+		e.Direction = EmailDirectionInbound
+	}
+	if !ValidEmailDirection(e.Direction) {
+		return nil, false, fmt.Errorf("%w: unknown direction %q: use one of %s",
+			ErrInvalidApplicationEmail, e.Direction, strings.Join(EmailDirections, ", "))
+	}
+	if e.LinkedBy == EmailLinkedByMatcher {
+		if e.Status != "" && e.Status != EmailLinkStatusProposed {
+			return nil, false, fmt.Errorf("%w: a matcher may only propose a link, not set it to %q: "+
+				"post it as %q and let a human confirm it with PATCH /application-emails/{id}",
+				ErrInvalidApplicationEmail, e.Status, EmailLinkStatusProposed)
+		}
+		e.Status = EmailLinkStatusProposed
+	}
+	if e.Status == "" {
+		e.Status = EmailLinkStatusLinked
+	}
+	if !ValidEmailLinkStatus(e.Status) {
+		return nil, false, fmt.Errorf("%w: unknown status %q: use one of %s",
+			ErrInvalidApplicationEmail, e.Status, strings.Join(EmailLinkStatuses, ", "))
+	}
+	e.ApplicationID = applicationID
+	ts := now()
+
+	var existingID int64
+	err := s.db.QueryRow(`
+		SELECT id FROM application_emails WHERE application_id=? AND account_id=? AND message_id=?`,
+		applicationID, e.AccountID, e.MessageID).Scan(&existingID)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		res, err := s.db.Exec(`
+			INSERT INTO application_emails
+			  (application_id, account_id, message_id, rfc_message_id, thread_id, direction,
+			   subject, from_address, occurred_at, linked_by, status, created_at)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+			applicationID, e.AccountID, e.MessageID, e.RFCMessageID, e.ThreadID, e.Direction,
+			e.Subject, e.FromAddress, e.OccurredAt, e.LinkedBy, e.Status, ts)
+		if err != nil {
+			return nil, false, err
+		}
+		id, _ := res.LastInsertId()
+		got, err := s.GetApplicationEmail(id)
+		return got, true, err
+	case err != nil:
+		return nil, false, err
+	default:
+		if _, err := s.db.Exec(`
+			UPDATE application_emails SET
+			  rfc_message_id=?, thread_id=?, direction=?, subject=?, from_address=?, occurred_at=?
+			WHERE id=?`,
+			e.RFCMessageID, e.ThreadID, e.Direction, e.Subject, e.FromAddress, e.OccurredAt,
+			existingID); err != nil {
+			return nil, false, err
+		}
+		got, err := s.GetApplicationEmail(existingID)
+		return got, false, err
+	}
+}
+
+// GetApplicationEmail fetches one email link by id.
+func (s *Store) GetApplicationEmail(id int64) (*ApplicationEmail, error) {
+	row := s.db.QueryRow(applicationEmailCols+` FROM application_emails WHERE id=?`, id)
+	return scanApplicationEmail(row)
+}
+
+// ListApplicationEmails returns an application's linked mail, oldest first.
+// Proposed links are included: a proposal a caller never sees is a proposal
+// nobody can confirm.
+func (s *Store) ListApplicationEmails(applicationID int64) ([]*ApplicationEmail, error) {
+	rows, err := s.db.Query(applicationEmailCols+
+		` FROM application_emails WHERE application_id=? ORDER BY occurred_at ASC, id ASC`,
+		applicationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*ApplicationEmail
+	for rows.Next() {
+		e, err := scanApplicationEmail(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// ApplicationEmailPatch is the confirm/reject channel for a proposed link. It
+// carries only the verdict: everything else about a message belongs to mailstack,
+// and a re-post is how the descriptive fields are refreshed.
+type ApplicationEmailPatch struct {
+	Status *string `json:"status"`
+}
+
+// PatchApplicationEmail records the human verdict on a link and returns the fresh
+// row.
+func (s *Store) PatchApplicationEmail(id int64, p ApplicationEmailPatch) (*ApplicationEmail, error) {
+	if p.Status == nil {
+		return s.GetApplicationEmail(id)
+	}
+	if !ValidEmailLinkStatus(*p.Status) {
+		return nil, fmt.Errorf("%w: unknown status %q: use one of %s",
+			ErrInvalidApplicationEmail, *p.Status, strings.Join(EmailLinkStatuses, ", "))
+	}
+	res, err := s.db.Exec(`UPDATE application_emails SET status=? WHERE id=?`, *p.Status, id)
+	if err != nil {
+		return nil, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil, ErrNotFound
+	}
+	return s.GetApplicationEmail(id)
+}
+
+// DeleteApplicationEmail removes a link. The message itself is mailstack's and is
+// untouched — this only says the two are not related.
+func (s *Store) DeleteApplicationEmail(id int64) error {
+	res, err := s.db.Exec(`DELETE FROM application_emails WHERE id=?`, id)
 	if err != nil {
 		return err
 	}
@@ -1583,22 +2377,255 @@ func (s *Store) DeleteApplication(id int64) error {
 	return nil
 }
 
-const applicationCols = `SELECT id, listing_id, status, resume_document_id,
-	cover_letter_document_id, cover_letter_body, answers, agent_session_id, submitted_at,
-	error, created_at, updated_at`
+// AdvanceApplicationStageFromEmail moves an application's stage on the strength
+// of one email, and is the ONLY path by which mail drives a stage. That is
+// deliberate: the rule "only a linked email may drive a stage change" is enforced
+// here, in the single place it can be enforced, rather than restated in every
+// caller that reads mail.
+//
+// A proposed link is refused. A matcher's guess that mail from a company domain
+// belongs to this application is exactly the guess that would otherwise file a
+// rejection under the wrong job — and the stage it moved would look, in the
+// timeline, exactly like one a person had confirmed.
+func (s *Store) AdvanceApplicationStageFromEmail(emailID int64, stage, note string) (*Application, error) {
+	email, err := s.GetApplicationEmail(emailID)
+	if err != nil {
+		return nil, err
+	}
+	if email.Status != EmailLinkStatusLinked {
+		return nil, fmt.Errorf("%w: email link %d is %q, and only a %q email may drive a stage "+
+			"change: confirm it first with PATCH /application-emails/%d {\"status\":%q}",
+			ErrInvalidApplicationEmail, emailID, email.Status, EmailLinkStatusLinked,
+			emailID, EmailLinkStatusLinked)
+	}
+	if !ValidApplicationStage(stage) {
+		return nil, fmt.Errorf("%w: unknown stage %q: use one of %s",
+			ErrInvalidApplication, stage, strings.Join(ApplicationStages, ", "))
+	}
+	if strings.TrimSpace(note) == "" {
+		// The trace says which message moved it, so the timeline can be read back to
+		// the mail it came from without a second lookup.
+		note = fmt.Sprintf("email from %s: %s", email.FromAddress, email.Subject)
+	}
+	occurredAt := email.OccurredAt
+	source := EventSourceEmail
+	return s.PatchApplication(email.ApplicationID, ApplicationPatch{
+		Stage:           &stage,
+		EventNote:       &note,
+		EventSource:     &source,
+		EventOccurredAt: &occurredAt,
+	})
+}
 
-func scanApplication(sc scanner) (*Application, error) {
-	var a Application
-	var answers string
-	err := sc.Scan(&a.ID, &a.ListingID, &a.Status, &a.ResumeDocumentID, &a.CoverLetterDocumentID,
-		&a.CoverLetterBody, &answers, &a.AgentSessionID, &a.SubmittedAt, &a.Error,
-		&a.CreatedAt, &a.UpdatedAt)
+const applicationEmailCols = `SELECT id, application_id, account_id, message_id, rfc_message_id,
+	thread_id, direction, subject, from_address, occurred_at, linked_by, status, created_at`
+
+func scanApplicationEmail(sc scanner) (*ApplicationEmail, error) {
+	var e ApplicationEmail
+	err := sc.Scan(&e.ID, &e.ApplicationID, &e.AccountID, &e.MessageID, &e.RFCMessageID,
+		&e.ThreadID, &e.Direction, &e.Subject, &e.FromAddress, &e.OccurredAt, &e.LinkedBy,
+		&e.Status, &e.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
-	a.Answers = unmarshalAnswers(answers)
-	return &a, nil
+	return &e, nil
+}
+
+// ---- Application tasks ----
+
+// LinkApplicationTask points an application at a noteboard todo. The id is all
+// that is stored: noteboard owns the title, the body and whether it is done, and
+// a copy of any of them here would be a second truth that drifts the first time
+// one is edited.
+//
+// Linking the same todo twice returns the existing link rather than failing —
+// the relationship already holds, and there is nothing to change about it.
+func (s *Store) LinkApplicationTask(applicationID int64, noteboardID string) (*ApplicationTask, bool, error) {
+	if _, err := s.GetApplication(applicationID); err != nil {
+		return nil, false, err
+	}
+	noteboardID = strings.TrimSpace(noteboardID)
+	if noteboardID == "" {
+		return nil, false, fmt.Errorf("%w: noteboard_id required: create the todo in noteboard "+
+			"first and link the id it returns — a local id would point at nothing",
+			ErrInvalidApplicationTask)
+	}
+	var existingID int64
+	err := s.db.QueryRow(`SELECT id FROM application_tasks WHERE application_id=? AND noteboard_id=?`,
+		applicationID, noteboardID).Scan(&existingID)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		res, err := s.db.Exec(`
+			INSERT INTO application_tasks (application_id, noteboard_id, created_at) VALUES (?,?,?)`,
+			applicationID, noteboardID, now())
+		if err != nil {
+			return nil, false, err
+		}
+		id, _ := res.LastInsertId()
+		got, err := s.GetApplicationTask(id)
+		return got, true, err
+	case err != nil:
+		return nil, false, err
+	default:
+		got, err := s.GetApplicationTask(existingID)
+		return got, false, err
+	}
+}
+
+// GetApplicationTask fetches one task link by id.
+func (s *Store) GetApplicationTask(id int64) (*ApplicationTask, error) {
+	row := s.db.QueryRow(applicationTaskCols+` FROM application_tasks WHERE id=?`, id)
+	return scanApplicationTask(row)
+}
+
+// ListApplicationTasks returns an application's task links, oldest first. These
+// are ids only — call ExpandApplicationTasks to read what they say.
+func (s *Store) ListApplicationTasks(applicationID int64) ([]*ApplicationTask, error) {
+	rows, err := s.db.Query(applicationTaskCols+
+		` FROM application_tasks WHERE application_id=? ORDER BY created_at ASC, id ASC`,
+		applicationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*ApplicationTask
+	for rows.Next() {
+		t, err := scanApplicationTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// DeleteApplicationTask removes a link. The todo itself stays in noteboard, which
+// owns it: unlinking is not the same as the work no longer needing doing.
+func (s *Store) DeleteApplicationTask(id int64) error {
+	res, err := s.db.Exec(`DELETE FROM application_tasks WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ExpandApplicationTasks reads every linked todo through noteboard, at request
+// time, and returns them as noteboard served them.
+//
+// It never returns a bare empty list for a failure. If noteboard cannot be
+// reached at all, Items is nil and Error says so; if some todos could be read and
+// others could not, the ones that failed carry their own error and the whole
+// expansion is marked incomplete. An application that silently showed zero
+// outstanding tasks would be worse than one that admits it cannot tell.
+func (s *Store) ExpandApplicationTasks(applicationID int64) (*ApplicationTasksExpansion, error) {
+	links, err := s.ListApplicationTasks(applicationID)
+	if err != nil {
+		return nil, err
+	}
+	expansion := &ApplicationTasksExpansion{Items: []ApplicationTaskExpansion{}}
+	failed := 0
+	var firstFailure string
+	for _, link := range links {
+		item := ApplicationTaskExpansion{
+			ID:          link.ID,
+			NoteboardID: link.NoteboardID,
+			CreatedAt:   link.CreatedAt,
+		}
+		raw, err := s.noteboard.GetItem(link.NoteboardID)
+		if err != nil {
+			failed++
+			item.Error = err.Error()
+			if firstFailure == "" {
+				firstFailure = err.Error()
+			}
+		} else {
+			item.Item = raw
+		}
+		expansion.Items = append(expansion.Items, item)
+	}
+	if failed > 0 {
+		expansion.Error = fmt.Sprintf("%d of %d linked todo(s) could not be read from noteboard, "+
+			"so this list is incomplete: %s", failed, len(links), firstFailure)
+		if failed == len(links) {
+			// Nothing at all could be read: hand back null rather than a list of
+			// placeholders a UI might render as "no tasks".
+			expansion.Items = nil
+		}
+	}
+	return expansion, nil
+}
+
+// CreateStandardApplicationTasks creates the standard follow-up todos for an
+// application IN NOTEBOARD, and links the ids noteboard hands back.
+//
+// The todos are created in the store that owns them and the returned ids are what
+// is stored here. Nothing local is invented, and nothing is joined by title —
+// two applications at the same company would collide the first time it mattered.
+//
+// It refuses when the application already has linked tasks. Running it twice
+// would put a second copy of every follow-up in the todo queue, and the reminder
+// coordinator would then nag about each of them separately.
+func (s *Store) CreateStandardApplicationTasks(applicationID int64) ([]*ApplicationTask, error) {
+	app, err := s.GetApplication(applicationID)
+	if err != nil {
+		return nil, err
+	}
+	existing, err := s.ListApplicationTasks(applicationID)
+	if err != nil {
+		return nil, err
+	}
+	if len(existing) > 0 {
+		return nil, fmt.Errorf("%w: application %d already has %d linked task(s): creating the "+
+			"standard set again would duplicate every follow-up in your todo queue. Unlink them "+
+			"first, or create the one todo you want in noteboard and POST its id",
+			ErrInvalidApplicationTask, applicationID, len(existing))
+	}
+	listing, err := s.GetListingIncludingDeleted(app.ListingID)
+	if err != nil {
+		return nil, err
+	}
+	ts := time.Now()
+	var out []*ApplicationTask
+	for _, standard := range StandardApplicationTasks {
+		todo := NoteboardTodo{
+			Title: fmt.Sprintf(standard.TitleFormat, listing.Company, listing.Title),
+			Body: fmt.Sprintf("job-store application %d — listing %d: %s at %s\n%s",
+				app.ID, listing.ID, listing.Title, listing.Company, listing.URL),
+			Tags:  StandardApplicationTaskTags,
+			DueAt: ts.AddDate(0, 0, standard.DueInDays).Format(time.RFC3339),
+		}
+		noteboardID, err := s.noteboard.CreateTodo(todo)
+		if err != nil {
+			// Loud and partial rather than silent and partial: the links already made
+			// are real and stay, and the caller is told which create failed.
+			return out, fmt.Errorf("%w (%d of %d standard todo(s) created)",
+				err, len(out), len(StandardApplicationTasks))
+		}
+		link, _, err := s.LinkApplicationTask(applicationID, noteboardID)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, link)
+	}
+	return out, nil
+}
+
+const applicationTaskCols = `SELECT id, application_id, noteboard_id, created_at`
+
+func scanApplicationTask(sc scanner) (*ApplicationTask, error) {
+	var t ApplicationTask
+	err := sc.Scan(&t.ID, &t.ApplicationID, &t.NoteboardID, &t.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
 }

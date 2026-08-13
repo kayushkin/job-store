@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -53,6 +54,20 @@ func RegisterHandlers(mux *http.ServeMux, s *Store) {
 	mux.HandleFunc("PATCH /applications/{id}", h.patchApplication)
 	mux.HandleFunc("POST /applications/{id}/submit", h.submitApplication)
 	mux.HandleFunc("DELETE /applications/{id}", h.deleteApplication)
+
+	mux.HandleFunc("GET /applications/{id}/events", h.listApplicationEvents)
+	mux.HandleFunc("POST /applications/{id}/events", h.recordApplicationEvent)
+
+	mux.HandleFunc("GET /applications/{id}/emails", h.listApplicationEmails)
+	mux.HandleFunc("POST /applications/{id}/emails", h.linkApplicationEmail)
+	mux.HandleFunc("PATCH /application-emails/{id}", h.patchApplicationEmail)
+	mux.HandleFunc("DELETE /application-emails/{id}", h.deleteApplicationEmail)
+	mux.HandleFunc("POST /application-emails/{id}/stage", h.advanceStageFromEmail)
+
+	mux.HandleFunc("GET /applications/{id}/tasks", h.listApplicationTasks)
+	mux.HandleFunc("POST /applications/{id}/tasks", h.linkApplicationTask)
+	mux.HandleFunc("POST /applications/{id}/tasks/standard", h.createStandardApplicationTasks)
+	mux.HandleFunc("DELETE /application-tasks/{id}", h.deleteApplicationTask)
 }
 
 // uploadMemoryLimit is how much of a multipart upload ParseMultipartForm keeps
@@ -585,11 +600,20 @@ func (h *handler) deleteTailorRequest(w http.ResponseWriter, r *http.Request) {
 
 // ---- applications ----
 
+// listApplications filters on the two states separately. `status` is refused
+// rather than ignored: it named the field now called agent_status, and a filter
+// silently dropped would answer with every application instead of the ones asked
+// for — which reads as "nothing matched that" only after you count them.
 func (h *handler) listApplications(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
+	if q.Has("status") {
+		writeErr(w, http.StatusBadRequest, ErrStatusRenamed().Error())
+		return
+	}
 	apps, err := h.s.ListApplications(ApplicationFilter{
-		Status:    q.Get("status"),
-		ListingID: atoi64(q.Get("listing_id")),
+		Stage:       q.Get("stage"),
+		AgentStatus: q.Get("agent_status"),
+		ListingID:   atoi64(q.Get("listing_id")),
 	})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -598,12 +622,34 @@ func (h *handler) listApplications(w http.ResponseWriter, r *http.Request) {
 	if apps == nil {
 		apps = []*Application{}
 	}
+	// One noteboard read for the whole page, so a board can render "3 of 5 done"
+	// without a request per row. A noteboard that is down leaves every
+	// open_task_count null — "could not tell", never 0 — and the applications
+	// themselves are still served.
+	if err := h.s.CountOpenApplicationTasks(apps); err != nil {
+		log.Printf("[job-store] open task counts unavailable: %v", err)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"applications": apps})
 }
 
 func (h *handler) upsertApplication(w http.ResponseWriter, r *http.Request) {
+	// The body is decoded twice on purpose: once to catch a caller still sending
+	// the old `status`, which Application no longer has a field for and would
+	// therefore drop on the floor, and once for the record itself.
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "could not read the body: "+err.Error())
+		return
+	}
+	var legacy struct {
+		Status *string `json:"status"`
+	}
+	if err := json.Unmarshal(body, &legacy); err == nil && legacy.Status != nil {
+		writeErr(w, http.StatusBadRequest, ErrStatusRenamed().Error())
+		return
+	}
 	var a Application
-	if err := json.NewDecoder(r.Body).Decode(&a); err != nil {
+	if err := json.Unmarshal(body, &a); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad json: "+err.Error())
 		return
 	}
@@ -618,11 +664,32 @@ func (h *handler) upsertApplication(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, got)
 }
 
+// getApplication serves one application, and with ?expand=tasks also reads its
+// linked todos through noteboard at request time.
+//
+// A failed expansion is reported in the field itself rather than swallowed: the
+// application is still worth serving, but the task list must never come back as
+// an empty array when the truth is that nothing could be read.
 func (h *handler) getApplication(w http.ResponseWriter, r *http.Request) {
 	id := atoi64(r.PathValue("id"))
 	got, err := h.s.GetApplication(id)
 	if respondStoreError(w, err) {
 		return
+	}
+	if err := h.s.CountOpenApplicationTasks([]*Application{got}); err != nil {
+		log.Printf("[job-store] open task count unavailable for application %d: %v", id, err)
+	}
+	for _, expand := range r.URL.Query()["expand"] {
+		for _, field := range strings.Split(expand, ",") {
+			if strings.TrimSpace(field) != "tasks" {
+				continue
+			}
+			tasks, err := h.s.ExpandApplicationTasks(id)
+			if respondStoreError(w, err) {
+				return
+			}
+			got.Tasks = tasks
+		}
 	}
 	writeJSON(w, http.StatusOK, got)
 }
@@ -658,7 +725,9 @@ func (h *handler) submitApplication(w http.ResponseWriter, r *http.Request) {
 			"a human confirmation gate before anything is sent under your name",
 		},
 		"do_instead": "record the outcome yourself: PATCH /applications/" +
-			strconv.FormatInt(id, 10) + ` {"status":"submitted","submitted_at":<epoch>}`,
+			strconv.FormatInt(id, 10) +
+			` {"agent_status":"submitted","stage":"submitted","submitted_at":<epoch>}` +
+			" — agent_status is what the automation did, stage is where you stand with the employer",
 	})
 }
 
@@ -666,6 +735,185 @@ func (h *handler) deleteApplication(w http.ResponseWriter, r *http.Request) {
 	id := atoi64(r.PathValue("id"))
 	err := h.s.DeleteApplication(id)
 	if respondStoreError(w, err) {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// ---- application events ----
+
+func (h *handler) listApplicationEvents(w http.ResponseWriter, r *http.Request) {
+	id := atoi64(r.PathValue("id"))
+	if _, err := h.s.GetApplication(id); respondStoreError(w, err) {
+		return
+	}
+	events, err := h.s.ListApplicationEvents(id)
+	if respondStoreError(w, err) {
+		return
+	}
+	if events == nil {
+		events = []*ApplicationEvent{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"events": events})
+}
+
+// recordApplicationEvent appends a note to the timeline: something that happened
+// without moving the stage. A stage change goes through PATCH /applications/{id},
+// which appends its own event — so this route cannot write one, and a timeline
+// can never claim a move the application never made.
+func (h *handler) recordApplicationEvent(w http.ResponseWriter, r *http.Request) {
+	id := atoi64(r.PathValue("id"))
+	var e ApplicationEvent
+	if err := json.NewDecoder(r.Body).Decode(&e); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad json: "+err.Error())
+		return
+	}
+	got, err := h.s.RecordApplicationEvent(id, e)
+	if respondStoreError(w, err) {
+		return
+	}
+	writeJSON(w, http.StatusCreated, got)
+}
+
+// ---- application emails ----
+
+func (h *handler) listApplicationEmails(w http.ResponseWriter, r *http.Request) {
+	id := atoi64(r.PathValue("id"))
+	if _, err := h.s.GetApplication(id); respondStoreError(w, err) {
+		return
+	}
+	emails, err := h.s.ListApplicationEmails(id)
+	if respondStoreError(w, err) {
+		return
+	}
+	if emails == nil {
+		emails = []*ApplicationEmail{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"emails": emails})
+}
+
+func (h *handler) linkApplicationEmail(w http.ResponseWriter, r *http.Request) {
+	id := atoi64(r.PathValue("id"))
+	var e ApplicationEmail
+	if err := json.NewDecoder(r.Body).Decode(&e); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad json: "+err.Error())
+		return
+	}
+	got, created, err := h.s.LinkApplicationEmail(id, &e)
+	if respondStoreError(w, err) {
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	writeJSON(w, status, got)
+}
+
+// patchApplicationEmail is the confirm/reject channel: a matcher proposes a link
+// and a human decides. It is the only way a link becomes `linked`, and therefore
+// the only way one becomes able to drive a stage.
+func (h *handler) patchApplicationEmail(w http.ResponseWriter, r *http.Request) {
+	id := atoi64(r.PathValue("id"))
+	var p ApplicationEmailPatch
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad json: "+err.Error())
+		return
+	}
+	got, err := h.s.PatchApplicationEmail(id, p)
+	if respondStoreError(w, err) {
+		return
+	}
+	writeJSON(w, http.StatusOK, got)
+}
+
+func (h *handler) deleteApplicationEmail(w http.ResponseWriter, r *http.Request) {
+	id := atoi64(r.PathValue("id"))
+	if respondStoreError(w, h.s.DeleteApplicationEmail(id)) {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// advanceStageFromEmail is the one route through which mail moves an application,
+// so "only a linked email may drive a stage change" is enforced in a single place
+// instead of asked of every caller that reads mail. A proposed link is a 400.
+func (h *handler) advanceStageFromEmail(w http.ResponseWriter, r *http.Request) {
+	id := atoi64(r.PathValue("id"))
+	var req struct {
+		Stage string `json:"stage"`
+		Note  string `json:"note"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad json: "+err.Error())
+		return
+	}
+	got, err := h.s.AdvanceApplicationStageFromEmail(id, req.Stage, req.Note)
+	if respondStoreError(w, err) {
+		return
+	}
+	writeJSON(w, http.StatusOK, got)
+}
+
+// ---- application tasks ----
+
+func (h *handler) listApplicationTasks(w http.ResponseWriter, r *http.Request) {
+	id := atoi64(r.PathValue("id"))
+	if _, err := h.s.GetApplication(id); respondStoreError(w, err) {
+		return
+	}
+	tasks, err := h.s.ListApplicationTasks(id)
+	if respondStoreError(w, err) {
+		return
+	}
+	if tasks == nil {
+		tasks = []*ApplicationTask{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tasks": tasks})
+}
+
+// linkApplicationTask stores a noteboard todo id and nothing else. The todo has
+// to exist in noteboard already: this store never invents an id for a row it does
+// not own.
+func (h *handler) linkApplicationTask(w http.ResponseWriter, r *http.Request) {
+	id := atoi64(r.PathValue("id"))
+	var req struct {
+		NoteboardID string `json:"noteboard_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad json: "+err.Error())
+		return
+	}
+	got, created, err := h.s.LinkApplicationTask(id, req.NoteboardID)
+	if respondStoreError(w, err) {
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	writeJSON(w, status, got)
+}
+
+// createStandardApplicationTasks creates the standard follow-ups in noteboard and
+// links the ids noteboard hands back. A noteboard that cannot be reached is a 502
+// and no links are claimed — the alternative is an application listing todos that
+// were never created.
+func (h *handler) createStandardApplicationTasks(w http.ResponseWriter, r *http.Request) {
+	id := atoi64(r.PathValue("id"))
+	tasks, err := h.s.CreateStandardApplicationTasks(id)
+	if respondStoreError(w, err) {
+		return
+	}
+	if tasks == nil {
+		tasks = []*ApplicationTask{}
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"tasks": tasks})
+}
+
+func (h *handler) deleteApplicationTask(w http.ResponseWriter, r *http.Request) {
+	id := atoi64(r.PathValue("id"))
+	if respondStoreError(w, h.s.DeleteApplicationTask(id)) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
@@ -698,9 +946,17 @@ func respondStoreError(w http.ResponseWriter, err error) bool {
 		writeErr(w, http.StatusNotFound, "not found")
 		return true
 	}
+	// noteboard being down is neither the caller's mistake nor a bug in here, so it
+	// gets the status code that says "a dependency failed" rather than one that
+	// blames the caller or hides behind a 500.
+	if errors.Is(err, ErrNoteboard) {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return true
+	}
 	for _, invalid := range []error{
 		ErrInvalidSource, ErrInvalidListing, ErrInvalidRoleFamily,
 		ErrInvalidDocument, ErrInvalidApplication, ErrInvalidTailorRequest,
+		ErrInvalidApplicationEvent, ErrInvalidApplicationEmail, ErrInvalidApplicationTask,
 		ErrExtractionFailed,
 	} {
 		if errors.Is(err, invalid) {

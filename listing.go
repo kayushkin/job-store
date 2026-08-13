@@ -1,5 +1,7 @@
 package jobstore
 
+import "encoding/json"
+
 // Listing is one job posting a source turned up. It moves through the pipeline
 // statuses as the user and, later, an application agent act on it.
 type Listing struct {
@@ -176,15 +178,41 @@ type ApplicationAnswer struct {
 	Answer   string `json:"answer"`
 }
 
-// Application is one application against one listing. Phase 3: the table and CRUD
-// are real so the pipeline has somewhere to write, but nothing submits one yet.
+// Application is one application against one listing, and it carries two states
+// that must never collapse into one field:
+//
+//   - Stage is where you stand WITH THE EMPLOYER, and the source of truth for the
+//     pipeline from the moment an application exists.
+//   - AgentStatus is what the AUTOMATION has done. An agent failing to fill a form
+//     and a company rejecting you are not the same event.
+//
+// AgentStatus is the field previously called Status (column `status`, JSON
+// `status`). It was renamed because "status" on a record that tracks an employer
+// relationship no longer described what it holds.
 type Application struct {
 	ID int64 `json:"id"`
 	// ListingID is job-store's own listing id. It must resolve to a live listing
 	// — join on ids, never on a company or title, which collide.
-	ListingID             int64               `json:"listing_id"`
-	Status                string              `json:"status"`
-	ResumeDocumentID      int64               `json:"resume_document_id"`
+	ListingID int64 `json:"listing_id"`
+	// Stage is the employer-facing lifecycle: drafting -> ready -> submitted ->
+	// acknowledged -> screen -> interview -> onsite -> offer, plus the terminal
+	// rejected, withdrawn and ghosted. Every change to it appends an
+	// ApplicationEvent in the same transaction, so a stage can never move without
+	// leaving a trace.
+	Stage string `json:"stage"`
+	// AgentStatus is what the automation has done: draft, ready, submitted, failed.
+	AgentStatus      string `json:"agent_status"`
+	ResumeDocumentID int64  `json:"resume_document_id"`
+	// ResumeBodySHA256 pins the resume's CONTENT at the moment the automation
+	// reached submitted. The document id alone answers "which file" and not "which
+	// version", so without this an edited resume would quietly claim to be the copy
+	// an employer holds. Written once, never rewritten.
+	ResumeBodySHA256 string `json:"resume_body_sha256"`
+	// ResumeDrifted is derived on every read, never stored: it reports that the
+	// resume document's body no longer hashes to the pinned value. Not an error —
+	// it is the normal result of improving your resume — but you should know the
+	// copy an employer holds is not the copy on your screen.
+	ResumeDrifted         bool                `json:"resume_drifted"`
 	CoverLetterDocumentID int64               `json:"cover_letter_document_id"`
 	CoverLetterBody       string              `json:"cover_letter_body"`
 	Answers               []ApplicationAnswer `json:"answers"`
@@ -193,6 +221,109 @@ type Application struct {
 	Error                 string              `json:"error"`
 	CreatedAt             int64               `json:"created_at"`
 	UpdatedAt             int64               `json:"updated_at"`
+	// EmailCount is how many CONFIRMED messages are attached. Proposed links are
+	// left out: a matcher's guess is not mail from the employer until a person has
+	// said it is.
+	EmailCount int `json:"email_count"`
+	// TaskCount is how many noteboard todos are linked, which this store knows
+	// without asking anyone.
+	TaskCount int `json:"task_count"`
+	// OpenTaskCount is how many of those todos noteboard currently reports as
+	// open. It is a pointer because null has to mean "could not tell" — noteboard
+	// unreachable, or nobody asked — and 0 has to keep meaning "none outstanding".
+	// The GET routes populate it; a write response leaves it null rather than
+	// making every write wait on noteboard.
+	OpenTaskCount *int `json:"open_task_count"`
+	// LastActivityAt is the newest thing that actually HAPPENED: the latest
+	// timeline event or confirmed email. Deliberately not updated_at — an agent
+	// retrying a write is not a company writing back, and the days-quiet reading
+	// this feeds is about employer silence.
+	LastActivityAt int64 `json:"last_activity_at"`
+	// Tasks is present only on GET /applications/{id}?expand=tasks. It is read
+	// through noteboard at request time and is never a copy of what noteboard
+	// holds.
+	Tasks *ApplicationTasksExpansion `json:"tasks,omitempty"`
+}
+
+// ApplicationEvent is one entry in an application's timeline. Append-only: a
+// stage change writes one of these in the same transaction as the change itself,
+// because "when did I apply, when did they reply, how long have they been
+// silent" is a question a single mutable stage column cannot answer.
+//
+// StageFrom and StageTo are both empty on an event that records something which
+// happened without moving the stage — a note.
+type ApplicationEvent struct {
+	ID            int64  `json:"id"`
+	ApplicationID int64  `json:"application_id"`
+	StageFrom     string `json:"stage_from"`
+	StageTo       string `json:"stage_to"`
+	Note          string `json:"note"`
+	Source        string `json:"source"`
+	OccurredAt    int64  `json:"occurred_at"`
+	CreatedAt     int64  `json:"created_at"`
+}
+
+// ApplicationEmail joins an application to one message in mailstack (:8195),
+// which owns it. job-store keeps identifiers plus just enough to render a row
+// without a round-trip; it never becomes a second copy of your mail.
+//
+// The join key is (ApplicationID, AccountID, MessageID) — mailstack's own
+// per-account id, always present. RFCMessageID is carried because it is the only
+// identifier stable across accounts and folders, but it is OPTIONAL per RFC 5322
+// §3.6.4 and may be empty, so it is a dedup aid and never the key.
+type ApplicationEmail struct {
+	ID            int64  `json:"id"`
+	ApplicationID int64  `json:"application_id"`
+	AccountID     string `json:"account_id"`
+	MessageID     string `json:"message_id"`
+	RFCMessageID  string `json:"rfc_message_id"`
+	ThreadID      string `json:"thread_id"`
+	Direction     string `json:"direction"`
+	Subject       string `json:"subject"`
+	FromAddress   string `json:"from_address"`
+	OccurredAt    int64  `json:"occurred_at"`
+	LinkedBy      string `json:"linked_by"`
+	// Status gates what the link may do. A matcher may only propose; a human
+	// confirms it to linked. Only a linked email may drive a stage change —
+	// guessing that mail from a company domain belongs to a given application is
+	// exactly the guess that files a rejection under the wrong job.
+	Status    string `json:"status"`
+	CreatedAt int64  `json:"created_at"`
+}
+
+// ApplicationTask links an application to a noteboard todo, and stores its id and
+// nothing else. noteboard owns the title, body and status; copying any of them
+// here would create a second truth that drifts the first time one is edited.
+type ApplicationTask struct {
+	ID            int64 `json:"id"`
+	ApplicationID int64 `json:"application_id"`
+	// NoteboardID is the noteboard item uuid, the only reference kept.
+	NoteboardID string `json:"noteboard_id"`
+	CreatedAt   int64  `json:"created_at"`
+}
+
+// ApplicationTasksExpansion is what ?expand=tasks returns: the linked todos as
+// noteboard itself serves them.
+//
+// Error is the whole point of the type. If noteboard cannot be reached, or a
+// linked todo cannot be read, that is said out loud — an application silently
+// showing zero outstanding tasks is worse than one that admits it cannot tell.
+// Items is nil (JSON null) when nothing could be read at all, so "no tasks" and
+// "could not tell" can never be confused.
+type ApplicationTasksExpansion struct {
+	Items []ApplicationTaskExpansion `json:"items"`
+	Error string                     `json:"error,omitempty"`
+}
+
+// ApplicationTaskExpansion is one linked todo as noteboard serves it. Item is the
+// noteboard record passed through unchanged — this layer is transparent, and a
+// narrower copy of noteboard's shape here would be a second schema to drift.
+type ApplicationTaskExpansion struct {
+	ID          int64           `json:"id"`
+	NoteboardID string          `json:"noteboard_id"`
+	CreatedAt   int64           `json:"created_at"`
+	Item        json.RawMessage `json:"item,omitempty"`
+	Error       string          `json:"error,omitempty"`
 }
 
 // The listing pipeline. candidate -> the user picks -> interested -> an agent
@@ -348,26 +479,159 @@ func ValidDocumentFormat(format string) bool {
 	return false
 }
 
-// Application statuses.
+// Application agent statuses: what the AUTOMATION has done. This is the field
+// once called simply "status", renamed because it never described the employer
+// relationship the record now tracks — an agent failing to fill a form and a
+// company rejecting you are not the same event.
 const (
-	ApplicationStatusDraft     = "draft"
-	ApplicationStatusReady     = "ready"
-	ApplicationStatusSubmitted = "submitted"
-	ApplicationStatusFailed    = "failed"
+	ApplicationAgentStatusDraft     = "draft"
+	ApplicationAgentStatusReady     = "ready"
+	ApplicationAgentStatusSubmitted = "submitted"
+	ApplicationAgentStatusFailed    = "failed"
 )
 
-// ApplicationStatuses is the whole vocabulary, so an error can name it.
-var ApplicationStatuses = []string{
-	ApplicationStatusDraft,
-	ApplicationStatusReady,
-	ApplicationStatusSubmitted,
-	ApplicationStatusFailed,
+// ApplicationAgentStatuses is the whole vocabulary, so an error can name it.
+var ApplicationAgentStatuses = []string{
+	ApplicationAgentStatusDraft,
+	ApplicationAgentStatusReady,
+	ApplicationAgentStatusSubmitted,
+	ApplicationAgentStatusFailed,
 }
 
-// ValidApplicationStatus reports whether a status is one this store recognizes.
-func ValidApplicationStatus(status string) bool {
-	for _, s := range ApplicationStatuses {
+// ValidApplicationAgentStatus reports whether an agent status is one this store
+// recognizes.
+func ValidApplicationAgentStatus(agentStatus string) bool {
+	for _, s := range ApplicationAgentStatuses {
+		if s == agentStatus {
+			return true
+		}
+	}
+	return false
+}
+
+// Application stages: where you stand WITH THE EMPLOYER, and the source of truth
+// for the pipeline from the moment an application exists.
+//
+// ghosted is a real stage, not a missing value. Silence is the most common
+// outcome in a job search, and a pipeline that can only say "submitted" forever
+// cannot tell you what to chase.
+const (
+	ApplicationStageDrafting     = "drafting"
+	ApplicationStageReady        = "ready"
+	ApplicationStageSubmitted    = "submitted"
+	ApplicationStageAcknowledged = "acknowledged"
+	ApplicationStageScreen       = "screen"
+	ApplicationStageInterview    = "interview"
+	ApplicationStageOnsite       = "onsite"
+	ApplicationStageOffer        = "offer"
+	ApplicationStageRejected     = "rejected"
+	ApplicationStageWithdrawn    = "withdrawn"
+	ApplicationStageGhosted      = "ghosted"
+)
+
+// ApplicationStages is the whole lifecycle in order, the three terminal stages
+// last, so an error message can name it and a UI can build its board from it
+// rather than from the values it happens to observe.
+var ApplicationStages = []string{
+	ApplicationStageDrafting,
+	ApplicationStageReady,
+	ApplicationStageSubmitted,
+	ApplicationStageAcknowledged,
+	ApplicationStageScreen,
+	ApplicationStageInterview,
+	ApplicationStageOnsite,
+	ApplicationStageOffer,
+	ApplicationStageRejected,
+	ApplicationStageWithdrawn,
+	ApplicationStageGhosted,
+}
+
+// ValidApplicationStage reports whether a stage is one this store recognizes.
+func ValidApplicationStage(stage string) bool {
+	for _, s := range ApplicationStages {
+		if s == stage {
+			return true
+		}
+	}
+	return false
+}
+
+// Who caused an application event.
+const (
+	EventSourceUser  = "user"
+	EventSourceAgent = "agent"
+	EventSourceEmail = "email"
+)
+
+// EventSources is the whole vocabulary, so an error can name it.
+var EventSources = []string{EventSourceUser, EventSourceAgent, EventSourceEmail}
+
+// ValidEventSource reports whether an event source is one this store recognizes.
+func ValidEventSource(source string) bool {
+	for _, s := range EventSources {
+		if s == source {
+			return true
+		}
+	}
+	return false
+}
+
+// Who linked an email to an application. A matcher is the only one of the three
+// that is guessing, which is why its links arrive proposed.
+const (
+	EmailLinkedByUser    = "user"
+	EmailLinkedByAgent   = "agent"
+	EmailLinkedByMatcher = "matcher"
+)
+
+// EmailLinkers is the whole vocabulary, so an error can name it.
+var EmailLinkers = []string{EmailLinkedByUser, EmailLinkedByAgent, EmailLinkedByMatcher}
+
+// ValidEmailLinker reports whether a linked_by value is one this store recognizes.
+func ValidEmailLinker(linkedBy string) bool {
+	for _, l := range EmailLinkers {
+		if l == linkedBy {
+			return true
+		}
+	}
+	return false
+}
+
+// Link states for an application email. Same discipline as a scouted source: a
+// guess arrives proposed and a human confirms it.
+const (
+	EmailLinkStatusProposed = "proposed"
+	EmailLinkStatusLinked   = "linked"
+	EmailLinkStatusRejected = "rejected"
+)
+
+// EmailLinkStatuses is the whole vocabulary, so an error can name it.
+var EmailLinkStatuses = []string{EmailLinkStatusProposed, EmailLinkStatusLinked, EmailLinkStatusRejected}
+
+// ValidEmailLinkStatus reports whether an email link status is one this store
+// recognizes.
+func ValidEmailLinkStatus(status string) bool {
+	for _, s := range EmailLinkStatuses {
 		if s == status {
+			return true
+		}
+	}
+	return false
+}
+
+// Which way an email went.
+const (
+	EmailDirectionInbound  = "inbound"
+	EmailDirectionOutbound = "outbound"
+)
+
+// EmailDirections is the whole vocabulary, so an error can name it.
+var EmailDirections = []string{EmailDirectionInbound, EmailDirectionOutbound}
+
+// ValidEmailDirection reports whether a direction is one this store recognizes.
+func ValidEmailDirection(direction string) bool {
+	for _, d := range EmailDirections {
+		if d == direction {
 			return true
 		}
 	}

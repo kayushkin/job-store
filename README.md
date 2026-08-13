@@ -92,8 +92,57 @@ document carrying `derived_from_document_id` and `listing_id`. A request against
 no description is a `400` — guessing from a job title produces exactly the generic letter this
 feature exists to avoid.
 
-**applications** — phase 3. The table and CRUD are real so the pipeline has somewhere to write;
+**applications** — the tracking layer is real; *submitting* is still phase 3, and
 `POST /applications/{id}/submit` answers `501` naming what is missing rather than pretending.
+
+An application carries **two states that must never collapse into one field**:
+
+- `stage` — where you stand with the **employer**: `drafting → ready → submitted → acknowledged
+  → screen → interview → onsite → offer`, plus terminal `rejected`, `withdrawn`, `ghosted`.
+  `ghosted` is a real stage, not a missing value.
+- `agent_status` — what the **automation** did: `draft`, `ready`, `submitted`, `failed`. This is
+  the field once called `status`; an agent failing to fill a form and a company rejecting you
+  are not the same event. The old spelling is **refused with a 400 naming both replacements**,
+  never ignored — on a create, on a patch, and as `?status=` on the list.
+
+Creating an application moves its listing to `applied` in the same transaction, once — and the
+listing never moves again: a later `PATCH /listings/{id}` carrying `status` on a listing that has
+an application is a 400 pointing at the application's stage. Everything else on that listing is
+still editable; only the pipeline question has an owner now.
+
+Every application row carries its own summary, all derived on read, on the list route as well as
+the detail one: `resume_drifted`, `email_count` (confirmed mail only), `task_count`,
+`open_task_count` and `last_activity_at`. `last_activity_at` comes from the timeline and the
+confirmed mail, **never `updated_at`** — an agent retrying a write is not a company writing back.
+`open_task_count` is `null` when noteboard could not be read, and never `0`.
+
+**application_events** — the timeline, append-only. `PATCH /applications/{id}` writing a new
+`stage` appends the event **in the same transaction**, so a stage cannot move without leaving a
+trace: if the event cannot be written the stage does not move either. `POST
+/applications/{id}/events` records a note — something that happened without a stage change — and
+deliberately cannot write a `stage_to`, which would let the timeline claim a move that never
+happened.
+
+**application_emails** — the join to [mailstack](../mailstack) on `:8195`, which owns the
+messages. The key is `(application_id, account_id, message_id)` — mailstack's own per-account
+id, always present. `rfc_message_id` is carried for cross-account dedup and is **never** the
+key: mailstack's own `backend/backend.go` says it is optional per RFC 5322 §3.6.4 and that no
+caller may key on it blindly. A matcher may only **propose** a link and is refused outright if
+it asks for `linked`; a human confirms it. **Only a `linked` email may drive a stage change**,
+enforced in the one place mail can move a stage — `POST /application-emails/{id}/stage`.
+
+**application_tasks** — noteboard todo ids and nothing else. `GET /applications/{id}?expand=tasks`
+reads each todo through noteboard (`NOTEBOARD_URL`, default `http://localhost:8191`) at request
+time and passes its record through unchanged. **An unreachable noteboard is an explicit error,
+never an empty list** — an application silently showing zero outstanding tasks is worse than one
+that admits it cannot tell. `POST /applications/{id}/tasks/standard` creates the standard
+follow-ups *in noteboard*, tagged `["jobs","personal"]`, and stores the ids noteboard hands back;
+with noteboard down it is a `502` and links nothing.
+
+**which resume was actually sent** — `resume_body_sha256` pins the resume's *content* when
+`agent_status` reaches `submitted`, and is never rewritten. `GET /applications/{id}` derives
+`resume_drifted` on every read, so improving your resume next month shows up as drift instead of
+quietly claiming the employer holds the new version.
 
 ## Routes
 

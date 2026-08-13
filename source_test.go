@@ -11,6 +11,11 @@ func openTestStore(t *testing.T) *Store {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
+	// Point noteboard at a port nothing listens on. The default is the real
+	// noteboard on this host, and a test suite that quietly read — or worse,
+	// wrote — the user's actual todos would be a test suite with side effects.
+	// A test that wants noteboard stands up its own stub and overrides this.
+	s.SetNoteboardBaseURL("http://127.0.0.1:1")
 	t.Cleanup(func() { s.Close() })
 	return s
 }

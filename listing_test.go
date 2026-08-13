@@ -449,14 +449,18 @@ func TestApplicationRoundTripsItsAnswers(t *testing.T) {
 	if !created {
 		t.Error("the first application for a listing was not reported as created")
 	}
-	if app.Status != ApplicationStatusDraft {
-		t.Errorf("status = %q, want %q", app.Status, ApplicationStatusDraft)
+	if app.AgentStatus != ApplicationAgentStatusDraft {
+		t.Errorf("agent_status = %q, want %q", app.AgentStatus, ApplicationAgentStatusDraft)
+	}
+	if app.Stage != ApplicationStageDrafting {
+		t.Errorf("stage = %q, want %q", app.Stage, ApplicationStageDrafting)
 	}
 	if len(app.Answers) != 2 || app.Answers[1].Answer != "No" {
 		t.Errorf("answers = %+v, want both screening pairs back", app.Answers)
 	}
 
-	again, created, err := s.UpsertApplication(&Application{ListingID: l.ID, Status: ApplicationStatusReady})
+	again, created, err := s.UpsertApplication(&Application{
+		ListingID: l.ID, AgentStatus: ApplicationAgentStatusReady})
 	if err != nil {
 		t.Fatalf("re-upsert: %v", err)
 	}

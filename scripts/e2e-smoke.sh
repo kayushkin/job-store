@@ -42,7 +42,12 @@ GO_TAGS="${GO_TAGS:-sqlite_fts5}"
 go build -tags "$GO_TAGS" -o /tmp/job-store-smoke ./cmd/job-store
 
 echo "==> start on $PORT (data=$DATA_DIR)"
-JOB_STORE_ADDR=":${PORT}" JOB_STORE_DATA_DIR="$DATA_DIR" /tmp/job-store-smoke &
+# noteboard is pointed at a port nothing listens on, on purpose: the task checks
+# below are about job-store SAYING it cannot reach noteboard rather than showing
+# an empty task list, and a smoke that happened to find the real noteboard up
+# would never exercise that.
+JOB_STORE_ADDR=":${PORT}" JOB_STORE_DATA_DIR="$DATA_DIR" NOTEBOARD_URL="http://127.0.0.1:1" \
+  /tmp/job-store-smoke &
 SRV_PID=$!
 for i in $(seq 1 30); do
   curl -sf "$BASE/health" >/dev/null 2>&1 && break
@@ -215,13 +220,119 @@ curl -sfS "$BASE/documents/$DID/render" | grep -qi '<h1' && pass "render returns
 
 echo "==> an application joins on the listing id, and submit is honestly 501"
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/applications" -H 'Content-Type: application/json' \
-  -d '{"listing_id":999999,"status":"draft"}')
+  -d '{"listing_id":999999}')
 [[ "$CODE" == "400" ]] && pass "an application for a nonexistent listing is a 400" || fail "bogus listing_id: HTTP $CODE"
 APP=$(curl -sfS -X POST "$BASE/applications" -H 'Content-Type: application/json' \
-  -d "{\"listing_id\":$LID,\"status\":\"draft\",\"resume_document_id\":$DID}")
+  -d "{\"listing_id\":$LID,\"agent_status\":\"draft\",\"resume_document_id\":$DID}")
 AID=$(printf '%s' "$APP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 CODE=$(curl -s -o /tmp/job-store-smoke-submit -w '%{http_code}' -X POST "$BASE/applications/$AID/submit")
 [[ "$CODE" == "501" ]] && pass "submit is 501, not a pretend success" || fail "submit: HTTP $CODE"
+
+echo "==> creating the application hands the pipeline over: the listing is now applied"
+curl -sfS "$BASE/listings/$LID" | grep -q '"status":"applied"' \
+  && pass "the listing moved to applied" || fail "the listing did not move to applied"
+
+echo "==> the field once called status is refused, never ignored"
+# A caller still sending `status` would otherwise get a 200 and no change, and go
+# on believing it had recorded something.
+CODE=$(curl -s -o /tmp/job-store-smoke-renamed -w '%{http_code}' -X PATCH "$BASE/applications/$AID" \
+  -H 'Content-Type: application/json' -d '{"status":"submitted"}')
+[[ "$CODE" == "400" ]] && pass "a patch with the old status field is a 400" || fail "patch status: HTTP $CODE"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/applications" \
+  -H 'Content-Type: application/json' -d "{\"listing_id\":$LID,\"status\":\"ready\"}")
+[[ "$CODE" == "400" ]] && pass "a create with the old status field is a 400" || fail "create status: HTTP $CODE"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/applications?status=draft")
+[[ "$CODE" == "400" ]] && pass "a list filter on the old status field is a 400" || fail "list status: HTTP $CODE"
+grep -q 'agent_status' /tmp/job-store-smoke-renamed && grep -q 'stage' /tmp/job-store-smoke-renamed \
+  && pass "the rejection names both replacements" || fail "rejection body: $(cat /tmp/job-store-smoke-renamed)"
+
+echo "==> a stage change cannot happen without leaving a trace"
+curl -sfS -X PATCH "$BASE/applications/$AID" -H 'Content-Type: application/json' \
+  -d '{"stage":"submitted","event_note":"applied through the careers page"}' \
+  | grep -q '"stage":"submitted"' && pass "stage change accepted" || fail "stage change"
+EVENTS=$(curl -sfS "$BASE/applications/$AID/events")
+[[ "$(count_key "$EVENTS" events)" == "2" ]] \
+  && pass "the timeline has the create and the stage change" || fail "events: $EVENTS"
+grep -q '"stage_from":"drafting","stage_to":"submitted"' <<<"$EVENTS" \
+  && pass "the event records where it moved from and to" || fail "event shape: $EVENTS"
+curl -sfS -X POST "$BASE/applications/$AID/events" -H 'Content-Type: application/json' \
+  -d '{"note":"recruiter called","source":"user"}' | grep -q '"note":"recruiter called"' \
+  && pass "a note is recorded without moving the stage" || fail "note event"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/applications/$AID/events" \
+  -H 'Content-Type: application/json' -d '{"note":"they said yes","stage_to":"offer"}')
+[[ "$CODE" == "400" ]] && pass "the note route cannot write a stage change" || fail "note route wrote a stage: HTTP $CODE"
+
+echo "==> only a confirmed email may drive a stage"
+EMAIL=$(curl -sfS -X POST "$BASE/applications/$AID/emails" -H 'Content-Type: application/json' \
+  -d '{"account_id":"gmail-personal","message_id":"18f2c9a1b","subject":"Your application","from_address":"careers@example.ai","linked_by":"matcher"}')
+echo "$EMAIL" | grep -q '"status":"proposed"' \
+  && pass "a matcher may only propose" || fail "matcher link: $EMAIL"
+EMAIL_ID=$(printf '%s' "$EMAIL" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/application-emails/$EMAIL_ID/stage" \
+  -H 'Content-Type: application/json' -d '{"stage":"acknowledged"}')
+[[ "$CODE" == "400" ]] && pass "a proposed email cannot move the stage" || fail "proposed email moved a stage: HTTP $CODE"
+curl -sfS "$BASE/applications/$AID" | grep -q '"stage":"submitted"' \
+  && pass "the stage is where it was" || fail "the stage moved on a proposal"
+curl -sfS -X PATCH "$BASE/application-emails/$EMAIL_ID" -H 'Content-Type: application/json' \
+  -d '{"status":"linked"}' | grep -q '"status":"linked"' && pass "a human confirms the link" || fail "confirm link"
+curl -sfS -X POST "$BASE/application-emails/$EMAIL_ID/stage" -H 'Content-Type: application/json' \
+  -d '{"stage":"acknowledged"}' | grep -q '"stage":"acknowledged"' \
+  && pass "a confirmed email moves the stage" || fail "confirmed email did not move the stage"
+curl -sfS "$BASE/applications/$AID/events" | grep -q '"source":"email"' \
+  && pass "the mail-driven move is on the timeline as such" || fail "no email-sourced event"
+
+echo "==> tasks are noteboard ids, and an unreachable noteboard is said out loud"
+# The standard set is created IN noteboard, so with noteboard down there are no
+# ids to store — and a 502 saying so beats links to todos that never existed.
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/applications/$AID/tasks/standard")
+[[ "$CODE" == "502" ]] && pass "standard tasks refuse rather than invent ids" || fail "standard tasks: HTTP $CODE"
+curl -sfS -X POST "$BASE/applications/$AID/tasks" -H 'Content-Type: application/json' \
+  -d '{"noteboard_id":"93c345b7-7536-4f37-a76a-25dc25d015a3"}' | grep -q '"noteboard_id"' \
+  && pass "a noteboard todo id is linked" || fail "link task"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/applications/$AID/tasks/standard")
+[[ "$CODE" == "400" ]] && pass "the standard set will not duplicate follow-ups it already has" \
+  || fail "standard tasks on an application with links: HTTP $CODE"
+EXPANDED=$(curl -sfS "$BASE/applications/$AID?expand=tasks")
+printf '%s' "$EXPANDED" | python3 -c 'import json,sys; t=json.load(sys.stdin)["tasks"]; sys.exit(0 if t.get("error") and t.get("items") is None else 1)' \
+  && pass "an unreachable noteboard is an explicit error, never an empty list" \
+  || fail "expand with noteboard down: $EXPANDED"
+
+echo "==> the listing status stops moving once an application owns the pipeline"
+CODE=$(curl -s -o /tmp/job-store-smoke-frozen -w '%{http_code}' -X PATCH "$BASE/listings/$LID" \
+  -H 'Content-Type: application/json' -d '{"status":"dismissed"}')
+[[ "$CODE" == "400" ]] && pass "a listing with an application refuses a status change" || fail "listing status: HTTP $CODE"
+curl -sfS -X PATCH "$BASE/listings/$LID" -H 'Content-Type: application/json' \
+  -d '{"notes":"screen scheduled"}' | grep -q 'screen scheduled' \
+  && pass "everything else on that listing is still editable" || fail "notes patch refused too"
+
+echo "==> a summary line needs no extra requests"
+SUMMARY=$(curl -sfS "$BASE/applications?stage=acknowledged")
+printf '%s' "$SUMMARY" | python3 -c '
+import json,sys
+app = json.load(sys.stdin)["applications"][0]
+for field in ("resume_drifted","email_count","task_count","open_task_count","last_activity_at"):
+    assert field in app, field
+assert app["email_count"] == 1, app["email_count"]
+assert app["task_count"] == 1, app["task_count"]
+# noteboard is unreachable in this smoke, so the open count must say "cannot tell".
+assert app["open_task_count"] is None, app["open_task_count"]
+assert app["last_activity_at"] > 0, app["last_activity_at"]
+' && pass "each row carries its own counts, and open_task_count is null rather than 0" \
+  || fail "summary fields: $SUMMARY"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/applications?stage=drafting")
+[[ "$CODE" == "200" ]] && pass "stage and agent_status are separate filters" || fail "stage filter: HTTP $CODE"
+
+echo "==> the resume that was actually sent is pinned, and drift is reported"
+SUBMITTED=$(curl -sfS -X PATCH "$BASE/applications/$AID" -H 'Content-Type: application/json' \
+  -d '{"agent_status":"submitted"}')
+printf '%s' "$SUBMITTED" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["resume_body_sha256"] else 1)' \
+  && pass "submitting pins the resume body" || fail "nothing pinned: $SUBMITTED"
+echo "$SUBMITTED" | grep -q '"resume_drifted":false' \
+  && pass "no drift the moment it was pinned" || fail "drift reported immediately: $SUBMITTED"
+curl -sfS -X PATCH "$BASE/documents/$DID" -H 'Content-Type: application/json' \
+  -d '{"body":"# Jane Dev\n\n- Go, SQLite, and a new bullet"}' >/dev/null
+curl -sfS "$BASE/applications/$AID" | grep -q '"resume_drifted":true' \
+  && pass "editing the resume shows up as drift" || fail "an edited resume did not read as drifted"
 
 echo "==> tailoring is queued, and it refuses a listing it cannot tailor against"
 # A listing with no real description has nothing to tailor against, and guessing

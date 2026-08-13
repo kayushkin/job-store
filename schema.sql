@@ -148,16 +148,25 @@ CREATE TABLE IF NOT EXISTS tailor_requests (
 );
 CREATE INDEX IF NOT EXISTS idx_tailor_pending ON tailor_requests(status, created_at);
 
--- applications: stubbed, phase 3. The table and CRUD are real so the pipeline has
--- somewhere to write; no agent submits one yet.
+-- applications: one application against one listing, carrying TWO states that
+-- must never collapse into one field. stage is where you stand with the employer
+-- and is the pipeline once an application exists; agent_status is what the
+-- automation has done. An agent failing to fill a form and a company rejecting
+-- you are not the same event.
+--
+-- agent_status is the column once called `status`. On a database created before
+-- the rename it is renamed in place by the ensureRenamedColumn call in Open(),
+-- never dropped and recreated, so no row loses what it held.
 CREATE TABLE IF NOT EXISTS applications (
     id                       INTEGER PRIMARY KEY AUTOINCREMENT,
-    listing_id               INTEGER NOT NULL,              -- job-store's own listing id, never the title
-    status                   TEXT NOT NULL DEFAULT 'draft', -- 'draft'|'ready'|'submitted'|'failed'
-    resume_document_id       INTEGER NOT NULL DEFAULT 0,    -- documents.id
-    cover_letter_document_id INTEGER NOT NULL DEFAULT 0,    -- documents.id, the template
-    cover_letter_body        TEXT NOT NULL DEFAULT '',      -- the rendered, listing-specific letter
-    answers                  TEXT NOT NULL DEFAULT '',      -- JSON array of {question, answer} screening pairs
+    listing_id               INTEGER NOT NULL,                 -- job-store's own listing id, never the title
+    stage                    TEXT NOT NULL DEFAULT 'drafting', -- where you stand with the EMPLOYER
+    agent_status             TEXT NOT NULL DEFAULT 'draft',    -- 'draft'|'ready'|'submitted'|'failed'
+    resume_document_id       INTEGER NOT NULL DEFAULT 0,       -- documents.id
+    resume_body_sha256       TEXT NOT NULL DEFAULT '',         -- what was ACTUALLY sent, pinned at submit
+    cover_letter_document_id INTEGER NOT NULL DEFAULT 0,       -- documents.id, the template
+    cover_letter_body        TEXT NOT NULL DEFAULT '',         -- the rendered, listing-specific letter
+    answers                  TEXT NOT NULL DEFAULT '',         -- JSON array of {question, answer} screening pairs
     agent_session_id         TEXT NOT NULL DEFAULT '',
     submitted_at             INTEGER NOT NULL DEFAULT 0,
     error                    TEXT NOT NULL DEFAULT '',
@@ -165,3 +174,62 @@ CREATE TABLE IF NOT EXISTS applications (
     updated_at               INTEGER NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_applications_listing ON applications(listing_id);
+
+-- application_events: the timeline, append-only. Every stage change is appended
+-- in the SAME transaction as the change, so a caller cannot move an application
+-- without leaving a trace. "When did I apply, when did they reply, how long have
+-- they been silent" is the question a job search actually asks, and one mutable
+-- stage column cannot answer it.
+--
+-- stage_from and stage_to are both empty on an event that records something which
+-- happened without moving the stage.
+CREATE TABLE IF NOT EXISTS application_events (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    application_id INTEGER NOT NULL,
+    stage_from     TEXT NOT NULL DEFAULT '',
+    stage_to       TEXT NOT NULL DEFAULT '',
+    note           TEXT NOT NULL DEFAULT '',
+    source         TEXT NOT NULL DEFAULT 'user',  -- 'user' | 'agent' | 'email'
+    occurred_at    INTEGER NOT NULL,
+    created_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_application_events ON application_events(application_id, occurred_at);
+
+-- application_emails: the join to mailstack (:8195), which OWNS the messages.
+-- Identifiers plus just enough to render a row without a round-trip, never a
+-- second copy of your mail.
+--
+-- The key is (application_id, account_id, message_id) — mailstack's own
+-- per-account id, always present. rfc_message_id is carried because it is the
+-- only identifier stable across accounts and folders, but mailstack's own source
+-- says it is OPTIONAL per RFC 5322 §3.6.4 and that no caller may key on it
+-- blindly, so it is a dedup aid here and never the primary key.
+CREATE TABLE IF NOT EXISTS application_emails (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    application_id INTEGER NOT NULL,
+    account_id     TEXT NOT NULL,                   -- mailstack account
+    message_id     TEXT NOT NULL,                   -- mailstack's own per-account message id
+    rfc_message_id TEXT NOT NULL DEFAULT '',        -- RFC 5322, brackets stripped. May be empty.
+    thread_id      TEXT NOT NULL DEFAULT '',
+    direction      TEXT NOT NULL DEFAULT 'inbound', -- 'inbound' | 'outbound'
+    subject        TEXT NOT NULL DEFAULT '',
+    from_address   TEXT NOT NULL DEFAULT '',
+    occurred_at    INTEGER NOT NULL DEFAULT 0,
+    linked_by      TEXT NOT NULL DEFAULT 'user',    -- 'user' | 'agent' | 'matcher'
+    status         TEXT NOT NULL DEFAULT 'linked',  -- 'proposed' | 'linked' | 'rejected'
+    created_at     INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_application_emails_msg
+    ON application_emails(application_id, account_id, message_id);
+
+-- application_tasks: noteboard todo ids and nothing else. noteboard owns the
+-- content; a title or status copied here would be a second truth that drifts the
+-- first time one of them is edited.
+CREATE TABLE IF NOT EXISTS application_tasks (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    application_id  INTEGER NOT NULL,
+    noteboard_id    TEXT NOT NULL,            -- noteboard item uuid, the only reference kept
+    created_at      INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_application_tasks
+    ON application_tasks(application_id, noteboard_id);

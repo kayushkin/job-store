@@ -306,21 +306,173 @@ the generic letter this feature exists to avoid.
 
 ---
 
-## `applications` — stubbed, phase 3
+## Two statuses, and which one owns what
 
-The table and CRUD are real so the pipeline has somewhere to write. **No agent runs one yet**;
+A listing and an application both have a state, and letting them overlap would give one
+question two answers. The split is by *whose* state it is:
+
+- **`listings.status`** — your interest in the **role**, before you commit:
+  `candidate → interested → dismissed`. **Creating an application moves it to `applied`, once,
+  in the same transaction as the insert — and it never moves again.** A later
+  `PATCH /listings/{id}` carrying `status` on a listing that has an application is a **400**
+  naming the application and its stage; every other field on that listing is still editable.
+  It never tracks the employer.
+- **`applications.stage`** — where you stand **with the employer**, and the source of truth
+  from the moment an application exists:
+  `drafting → ready → submitted → acknowledged → screen → interview → onsite → offer`, plus
+  the terminal `rejected`, `withdrawn` and `ghosted`.
+- **`applications.agent_status`** — what the **automation** has done: `draft`, `ready`,
+  `submitted`, `failed`. This is the field previously called `status`; it was renamed because
+  "status" on a record that now tracks an employer relationship no longer described it. An
+  agent failing to fill a form and a company rejecting you are not the same event and must
+  never collapse into one field.
+
+`ghosted` is a real stage, not a missing value. Silence is the most common outcome in a job
+search, and a pipeline that can only say `submitted` forever cannot tell you what to chase.
+
+### `application_events` — the timeline
+
+Every stage change is appended, never overwritten. "When did I apply, when did they reply, how
+long have they been silent" is the question a job search actually asks, and a single mutable
+`stage` column cannot answer it.
+
+```sql
+CREATE TABLE IF NOT EXISTS application_events (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    application_id INTEGER NOT NULL,
+    stage_from     TEXT NOT NULL DEFAULT '',
+    stage_to       TEXT NOT NULL DEFAULT '',
+    note           TEXT NOT NULL DEFAULT '',
+    source         TEXT NOT NULL DEFAULT 'user',  -- 'user' | 'agent' | 'email'
+    occurred_at    INTEGER NOT NULL,
+    created_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_application_events ON application_events(application_id, occurred_at);
+```
+
+`PATCH /applications/{id}` writing a new `stage` appends the event itself, in the same
+transaction. A caller cannot change a stage without leaving a trace.
+
+---
+
+## `application_emails` — what they actually sent you
+
+Joins an application to messages in **mailstack** (`:8195`), which owns them. job-store stores
+identifiers and just enough to render a row without a round-trip; it never becomes a second
+copy of your mail.
+
+```sql
+CREATE TABLE IF NOT EXISTS application_emails (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    application_id INTEGER NOT NULL,
+    account_id     TEXT NOT NULL,               -- mailstack account
+    message_id     TEXT NOT NULL,               -- mailstack's own per-account message id
+    rfc_message_id TEXT NOT NULL DEFAULT '',    -- RFC 5322, brackets stripped. May be empty.
+    thread_id      TEXT NOT NULL DEFAULT '',
+    direction      TEXT NOT NULL DEFAULT 'inbound', -- 'inbound' | 'outbound'
+    subject        TEXT NOT NULL DEFAULT '',
+    from_address   TEXT NOT NULL DEFAULT '',
+    occurred_at    INTEGER NOT NULL DEFAULT 0,
+    linked_by      TEXT NOT NULL DEFAULT 'user',    -- 'user' | 'agent' | 'matcher'
+    status         TEXT NOT NULL DEFAULT 'linked',  -- 'proposed' | 'linked' | 'rejected'
+    created_at     INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_application_emails_msg
+    ON application_emails(application_id, account_id, message_id);
+```
+
+**The join key is `(account_id, message_id)`** — mailstack's own id, always present. The RFC
+`Message-ID` is carried because it is the only identifier stable across accounts and folders,
+but mailstack's own source says it is optional per RFC 5322 §3.6.4 and that **no caller may key
+on it blindly**, so it is a dedup aid here and never the primary key.
+
+A matcher may **propose** a link (`status:"proposed"`, `linked_by:"matcher"`); a human confirms
+it to `linked`. Same discipline as a scouted source: guessing that an email from a company
+domain belongs to a given application is exactly the guess that quietly files a rejection under
+the wrong job. Only a `linked` email may drive a stage change, and
+`POST /application-emails/{id}/stage` is the one route that can do it — a `proposed` link there
+is a 400, so the rule lives in one place instead of being asked of every caller that reads mail.
+
+Linking one by hand: `POST /applications/{id}/emails` with
+
+```json
+{"account_id":"gmail-personal","message_id":"18f2c9a1b","direction":"inbound",
+ "subject":"…","from_address":"…","rfc_message_id":"…","thread_id":"…","occurred_at":0}
+```
+
+`account_id` and `message_id` are the only required fields. `direction` is accepted and
+defaults to `inbound`; `linked_by` defaults to `user`, which means the link lands `linked` — a
+person linking a message is not guessing. The decoder is **not** strict: an unknown field is
+ignored rather than rejected, so a caller sending extra keys gets a 201, not a 400. Re-posting
+the same `(account_id, message_id)` updates the descriptive fields and returns **200**;
+`status` and `linked_by` are omitted from that update, so a re-run cannot undo a verdict.
+
+---
+
+## `application_tasks` — the things you still have to do
+
+Tasks are **noteboard todos**. This table stores their ids and nothing else — no title, no
+body, no status copy. noteboard owns the content; duplicating it here would create a second
+truth that drifts the first time one is edited.
+
+```sql
+CREATE TABLE IF NOT EXISTS application_tasks (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    application_id  INTEGER NOT NULL,
+    noteboard_id    TEXT NOT NULL,            -- noteboard item uuid, the only reference kept
+    created_at      INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_application_tasks
+    ON application_tasks(application_id, noteboard_id);
+```
+
+`GET /applications/{id}?expand=tasks` reads each todo through noteboard at request time. If
+noteboard is unreachable the field is an explicit error, never an empty list — an application
+that silently shows zero outstanding tasks is worse than one that admits it cannot tell.
+
+The expansion is a **200 whose `tasks` field carries the error**, not a non-2xx: the application
+itself is still worth serving. The shape, exactly:
+
+```jsonc
+"tasks": {
+  "items": [                              // null — not [] — when NOTHING could be read
+    { "id": 7,                            // the application_tasks row
+      "noteboard_id": "93c345b7-…",
+      "created_at": 1786…,
+      "item": { "id": "93c345b7-…", "type": "todo", "title": "…", "status": "open", … },
+      "error": ""                         // present instead of `item` when THIS todo failed
+    }
+  ],
+  "error": ""                             // set whenever any todo could not be read
+}
+```
+
+`item` is noteboard's own record passed through **unchanged** — read `item.title` and
+`item.status`, not `title`/`status` on the wrapper. This layer is transparent on purpose: a
+flattened copy of a noteboard todo here would be a second, narrower schema to drift.
+
+`tasks` is absent entirely without `?expand=tasks`, which is not the same as an empty list.
+Without the parameter, `task_count` and `open_task_count` above are the summary to read.
+
+---
+
+## `applications` — submission is still phase 3
+
+The table, the CRUD and the whole tracking layer are real. **No agent submits one yet**;
 `POST /applications/{id}/submit` returns `501 not implemented` with a body naming what is
 missing, rather than pretending.
 
 ```sql
 CREATE TABLE IF NOT EXISTS applications (
     id                       INTEGER PRIMARY KEY AUTOINCREMENT,
-    listing_id               INTEGER NOT NULL,           -- job-store's own listing id, never the title
-    status                   TEXT NOT NULL DEFAULT 'draft', -- 'draft'|'ready'|'submitted'|'failed'
-    resume_document_id       INTEGER NOT NULL DEFAULT 0, -- documents.id
-    cover_letter_document_id INTEGER NOT NULL DEFAULT 0, -- documents.id, the template
-    cover_letter_body        TEXT NOT NULL DEFAULT '',   -- the rendered, listing-specific letter
-    answers                  TEXT NOT NULL DEFAULT '',   -- JSON array of {question, answer} screening pairs
+    listing_id               INTEGER NOT NULL,                 -- job-store's own listing id, never the title
+    stage                    TEXT NOT NULL DEFAULT 'drafting', -- where you stand with the EMPLOYER
+    agent_status             TEXT NOT NULL DEFAULT 'draft',    -- 'draft'|'ready'|'submitted'|'failed'
+    resume_document_id       INTEGER NOT NULL DEFAULT 0,       -- documents.id
+    resume_body_sha256       TEXT NOT NULL DEFAULT '',         -- what was ACTUALLY sent, pinned at submit
+    cover_letter_document_id INTEGER NOT NULL DEFAULT 0,       -- documents.id, the template
+    cover_letter_body        TEXT NOT NULL DEFAULT '',         -- the rendered, listing-specific letter
+    answers                  TEXT NOT NULL DEFAULT '',         -- JSON array of {question, answer} screening pairs
     agent_session_id         TEXT NOT NULL DEFAULT '',
     submitted_at             INTEGER NOT NULL DEFAULT 0,
     error                    TEXT NOT NULL DEFAULT '',
@@ -331,6 +483,47 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_applications_listing ON applications(listi
 ```
 
 `listing_id` must resolve to a live listing or the write is a 400 — join on ids, never names.
+Creating an application moves that listing to `applied` **in the same transaction**.
+
+`agent_status` is the column once called `status`. A database written before the rename is
+migrated in place (`ALTER TABLE … RENAME COLUMN`), keeping every value, and `stage` is
+backfilled only where the old value implies one: `submitted → submitted`, `ready → ready`,
+everything else the `drafting` default. The old spelling is **refused, not ignored** — a
+`status` field on a create or patch, or `?status=` on the list, is a 400 naming both
+replacements, because a silently dropped field is a caller believing it recorded something.
+
+Only `PATCH /applications/{id}` writes `stage`. `POST /applications` refreshes what the
+automation holds and never the stage, so "no stage change without an event" holds by
+construction rather than by every caller remembering.
+
+### Derived fields — every application row carries its own summary
+
+All four are computed on read, never stored, and they come back on **both** `GET /applications`
+and `GET /applications/{id}` so a board never has to fetch `/events`, `/emails` and `/tasks` per
+row just to render a line:
+
+| Field | What it is |
+|---|---|
+| `resume_drifted` | the resume document's body no longer hashes to `resume_body_sha256` |
+| `email_count` | how many **`linked`** emails are attached. A `proposed` link is a matcher's guess and does not count |
+| `task_count` | how many noteboard todos are linked. Known locally, always exact |
+| `open_task_count` | how many of those noteboard still reports as `open`, from **one** noteboard read for the whole page (`?type=todo&status=open&include_held=true`; a held todo is parked work, not finished work, so it counts). `null` means **could not tell** — noteboard unreachable, or a write response where nobody asked. It never collapses to `0` |
+| `last_activity_at` | the newest `occurred_at` across `application_events` and **`linked`** `application_emails`. Deliberately **not** `updated_at`: an agent retrying a write is not a company writing back, and this is what a "quiet for N days" column is measured from |
+
+A noteboard that is down does not fail the list — the applications are served with
+`open_task_count: null` and the reason is logged.
+
+### Which resume was actually sent
+
+`resume_document_id` names the document; `resume_body_sha256` pins its **content at the moment
+of submission**. Documents are editable, so the id alone answers "which file" and not "which
+version" — edit your resume next month and the id would quietly claim you sent the new one.
+The hash is written when `agent_status` reaches `submitted` and is never rewritten after.
+
+`GET /applications/{id}` therefore reports `resume_drifted: true` when the document's current
+body no longer hashes to the pinned value. That is not an error — it is the normal result of
+improving your resume — but you should know the copy an employer holds is not the copy on your
+screen before you walk into an interview.
 
 ---
 
@@ -366,17 +559,32 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_applications_listing ON applications(listi
 | GET | `/tailor-requests/{id}` | |
 | PATCH | `/tailor-requests/{id}` | the dispatcher's write channel |
 | DELETE | `/tailor-requests/{id}` | hard |
-| GET | `/applications` | `?status &listing_id` → `{"applications":[…]}` |
-| POST | `/applications` | upsert by `listing_id` |
-| GET | `/applications/{id}` | |
-| PATCH | `/applications/{id}` | |
+| GET | `/applications` | `?stage &agent_status &listing_id` → `{"applications":[…]}`, each row carrying `resume_drifted`, `email_count`, `task_count`, `open_task_count`, `last_activity_at`. `?status` is a **400** — it would be ambiguous between the two |
+| POST | `/applications` | upsert by `listing_id`; creating one moves the listing to `applied`. Never writes `stage` |
+| GET | `/applications/{id}` | `?expand=tasks` reads the linked todos through noteboard at request time |
+| PATCH | `/applications/{id}` | `{stage,agent_status,resume_document_id,…,event_note,event_source,event_occurred_at}`. A `stage` change appends its event in the same transaction |
 | POST | `/applications/{id}/submit` | **501**, phase 3 |
-| DELETE | `/applications/{id}` | hard |
+| DELETE | `/applications/{id}` | hard; takes the timeline, email links and task links with it |
+| GET | `/applications/{id}/events` | `{"events":[…]}`, oldest first |
+| POST | `/applications/{id}/events` | `{note,source,occurred_at}` → **201**. Records a note; a `stage_to` here is a 400 |
+| GET | `/applications/{id}/emails` | `{"emails":[…]}`, proposals included |
+| POST | `/applications/{id}/emails` | upsert by `(account_id,message_id)`; `linked_by:"matcher"` ⇒ `proposed`. Re-posting never touches `status` or `linked_by` |
+| PATCH | `/application-emails/{id}` | `{status}` — the confirm/reject channel |
+| DELETE | `/application-emails/{id}` | hard; the message itself is mailstack's |
+| POST | `/application-emails/{id}/stage` | `{stage,note}` — the ONLY path by which mail moves a stage. A `proposed` link is a **400** |
+| GET | `/applications/{id}/tasks` | `{"tasks":[…]}` — ids only |
+| POST | `/applications/{id}/tasks` | `{noteboard_id}` |
+| POST | `/applications/{id}/tasks/standard` | creates the standard follow-ups **in noteboard**, links the ids it returns → **201**. noteboard down ⇒ **502**; an application that already has links ⇒ **400** |
+| DELETE | `/application-tasks/{id}` | hard; the todo stays in noteboard |
 
 Errors are `{"error":"…"}`. One `respondStoreError` maps sentinel errors: `ErrNotFound` → 404,
 `ErrInvalidSource` / `ErrInvalidListing` / `ErrInvalidRoleFamily` / `ErrInvalidDocument` /
-`ErrInvalidApplication` → 400, anything else → 500. Error strings enumerate the valid values so
-an agent reading a 400 can retry without guessing.
+`ErrInvalidApplication` / `ErrInvalidApplicationEvent` / `ErrInvalidApplicationEmail` /
+`ErrInvalidApplicationTask` → 400, `ErrNoteboard` → **502** (a dependency is down, which is
+neither the caller's mistake nor a bug in here), anything else → 500. Error strings enumerate
+the valid values so an agent reading a 400 can retry without guessing.
+
+`NOTEBOARD_URL` overrides where the task routes read and write, default `http://localhost:8191`.
 
 ---
 
