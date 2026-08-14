@@ -192,9 +192,20 @@ func TestSourceDefaultsToActiveSoExistingCallersKeepWorking(t *testing.T) {
 	}
 }
 
-func TestScoutAndBoardAreValidKinds(t *testing.T) {
+// Every kind the vocabulary advertises must survive a write. The loop draws its
+// work from SourceKinds, so it asks nothing about a kind that has been deleted
+// from the table -- and the old name for this test, ScoutAndBoardAreValidKinds,
+// claimed coverage of two specific kinds that the loop does not actually
+// guarantee it visits. Measured 2026-08-14: deleting KindResearch or KindScout
+// left the whole package green, so the test named for scout stopped exercising
+// scout and said nothing. sourceKindFloor is what makes that a failure.
+const sourceKindFloor = 3
+
+func TestEverySourceKindIsAccepted(t *testing.T) {
 	s := openTestStore(t)
+	asserted := 0
 	for _, kind := range SourceKinds {
+		asserted++
 		src, _, err := s.UpsertSource(&Source{
 			Name: "source " + kind, Kind: kind, Target: "something", CadenceHours: 720,
 		})
@@ -204,6 +215,10 @@ func TestScoutAndBoardAreValidKinds(t *testing.T) {
 		if src.Kind != kind {
 			t.Errorf("kind = %q, want %q", src.Kind, kind)
 		}
+	}
+	if asserted < sourceKindFloor {
+		t.Errorf("wrote %d source kinds, want at least %d: a kind has been dropped from SourceKinds "+
+			"and this loop shrank with it", asserted, sourceKindFloor)
 	}
 }
 
