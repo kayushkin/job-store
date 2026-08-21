@@ -146,8 +146,14 @@ quietly claiming the employer holds the new version.
 
 ## Routes
 
-See the table in `CONTRACT.md`. Errors are `{"error":"…"}` and every 400 enumerates the valid
-values, so an agent reading one can retry without guessing.
+See the table in `CONTRACT.md`. Errors are `{"error":"…"}`. Every 400 raised by a **store
+sentinel** enumerates the valid values, so an agent reading one can retry without guessing —
+`GET /listings?role_family=nonsense` answers `invalid role family "nonsense": use one of
+Engineering, AI, Data, Product, Design, Leadership`. That is the scope `server.go`'s own comment
+above `respondStoreError` states, and it is narrower than "every 400": a malformed body answers
+`bad json: invalid character 'b' looking for beginning of object key string`, and a range rule
+answers `grace_days must not be negative`. Neither enumerates anything, because neither has a
+vocabulary to enumerate.
 
 ## Poller
 
