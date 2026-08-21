@@ -498,7 +498,7 @@ construction rather than by every caller remembering.
 
 ### Derived fields — every application row carries its own summary
 
-All four are computed on read, never stored, and they come back on **both** `GET /applications`
+All five are computed on read, never stored, and they come back on **both** `GET /applications`
 and `GET /applications/{id}` so a board never has to fetch `/events`, `/emails` and `/tasks` per
 row just to render a line:
 
