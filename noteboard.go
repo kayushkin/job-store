@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"strings"
 	"time"
@@ -49,12 +50,25 @@ func NewNoteboardClient(baseURL string) *NoteboardClient {
 	}
 }
 
+// itemURL returns the address of one noteboard item.
+//
+// noteboardID is assigned by noteboard, which owns it, so job-store does not
+// choose it and cannot assume its shape. Concatenating it raw let a '/', a '#'
+// or a '?' in the id re-address the request: an id of "../lists" read
+// /api/lists, a different noteboard endpoint that answers 200 with well-formed
+// JSON. GetItem passes those bytes through unchanged, so the caller would
+// receive the wrong entity rather than an error. PathEscape keeps the id one
+// path segment whatever it contains.
+func (c *NoteboardClient) itemURL(noteboardID string) string {
+	return strings.TrimSuffix(c.BaseURL, "/") + "/api/items/" + neturl.PathEscape(noteboardID)
+}
+
 // GetItem reads one noteboard item and returns it exactly as noteboard served
 // it. The bytes are passed through unchanged: this layer is transparent, and
 // decoding into a local struct would make job-store a second, narrower schema for
 // something noteboard owns.
 func (c *NoteboardClient) GetItem(noteboardID string) (json.RawMessage, error) {
-	url := c.BaseURL + "/api/items/" + noteboardID
+	url := c.itemURL(noteboardID)
 	resp, err := c.HTTP.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("%w: GET %s: %v", ErrNoteboard, url, err)
