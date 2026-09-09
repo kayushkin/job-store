@@ -167,3 +167,7 @@ wrong: a proposed source is never due, approving one makes it due, a re-poll nev
 decision, a prune never touches a listing the user has touched, an application cannot name a
 listing that does not exist, an extraction failure never becomes an empty body, `is_default` is
 exclusive per kind, and a malformed search is a rejection rather than an empty page of results.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
