@@ -74,14 +74,30 @@ func TestUnknownStageAndAgentStatusAreRejected(t *testing.T) {
 		t.Errorf("unknown agent_status error = %v, want ErrInvalidApplication", err)
 	}
 	// The whole vocabulary has to be in the message or a caller cannot retry
-	// without guessing.
+	// without guessing. "The whole vocabulary" is the claim, and this loop
+	// reads it from ApplicationStages, so it asks nothing about a stage that
+	// has been deleted from the table. Measured 2026-08-14: dropping Ready,
+	// Interview, Onsite, Offer, Withdrawn or Ghosted left the package green
+	// six times out of eleven. The floor is what makes the claim hold.
 	_, err := s.PatchApplication(app.ID, ApplicationPatch{Stage: &bogus})
+	named := 0
 	for _, stage := range ApplicationStages {
+		named++
 		if !strings.Contains(err.Error(), stage) {
 			t.Fatalf("the rejection %q does not name the stage %q", err, stage)
 		}
 	}
+	if named < applicationStageFloor {
+		t.Errorf("the rejection was checked against %d stages, want at least %d: a stage has been dropped "+
+			"from ApplicationStages, so it is gone from the vocabulary and from this check at once",
+			named, applicationStageFloor)
+	}
 }
+
+// Raise it when the board gains a stage; lower it only in the same commit that
+// drops one from ApplicationStages, because dropping a stage narrows what
+// PatchApplication will accept.
+const applicationStageFloor = 11
 
 // The note on a stage change has to survive the JSON boundary, and that is a
 // different claim from "the store persists a note" — which is why this test
