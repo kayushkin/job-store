@@ -27,6 +27,10 @@ import re
 import subprocess
 import sys
 
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import tree_hold  # noqa: E402  vendored; see tree_hold.py on keeping copies identical
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
 SOURCE = "noteboard.go"
 TESTS = "standardtasks_test.go"
@@ -154,6 +158,32 @@ def run_suite():
 
 
 def main():
+    """Take this tree exclusively, then run. Call this, not `main_on_a_held_tree`.
+
+    Card `d869d2be`. Every verdict below is read off the SUITE'S exit code, and that
+    exit code belongs to the whole tree rather than to the mutation this run wrote. A
+    second run mutating the same tree hands this one a red suite it did not cause, and
+    this one records it as CAUGHT — the collision does not add noise, it **inflates the
+    score**, and these scores are the numbers the nightly write-ups quote.
+
+    It refuses rather than waits. A run told to come back later can say so and exit;
+    one silently blocked for the length of somebody else's suite looks hung. The
+    refusal exits non-zero, because a caller reading exit 0 would read "measured, and
+    clean" from a run that measured nothing.
+
+    The restore-on-signal handling below is a different guard. It stops THIS run
+    leaving a mutation behind. It cannot see a concurrent run at all, because the
+    other run restores each file before its next case and the tree is clean between
+    mutations exactly when it is most dangerous to trust.
+    """
+    with tree_hold.exclusive_hold_on_tree(
+            REPO, purpose=os.path.basename(sys.argv[0] or "sabotage-standardtasks")) as refusal:
+        if refusal:
+            sys.exit("REFUSING: " + refusal)
+        return main_on_a_held_tree()
+
+
+def main_on_a_held_tree():
     paths = {name: REPO / name for name in (SOURCE, TESTS)}
     originals = {name: path.read_text() for name, path in paths.items()}
 
