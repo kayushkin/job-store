@@ -15,18 +15,19 @@
 # targets and notes and can never resurrect something already rejected.
 #
 # ── Verification, 2026-08-13 ────────────────────────────────────────────────────
-# Every board below was checked live on 2026-08-13 by calling its ATS JSON API and
-# counting the openings it returned. Open-role counts on that date, in the order
-# they appear below:
-#   Greenhouse (boards-api.greenhouse.io/v1/boards/<token>/jobs):
-#     anthropic 420 · databricks 807 · vercel 83 · temporaltechnologies 55 ·
-#     grafanalabs 147 · sourcegraph91 8 · cloudflare 305 · gitlab 201
-#   Ashby (api.ashbyhq.com/posting-api/job-board/<token>):
+# All 24 boards below were checked live on 2026-08-13 by calling each ATS JSON API
+# and counting the openings it returned. Every token seeded below appears here, in
+# the order it is seeded; open-role counts are as of that date:
+#   Greenhouse (boards-api.greenhouse.io/v1/boards/<token>/jobs) — 9:
+#     anthropic 420 · scaleai 210 · databricks 807 · vercel 83 ·
+#     temporaltechnologies 55 · grafanalabs 147 · sourcegraph91 8 ·
+#     cloudflare 305 · gitlab 201
+#   Ashby (api.ashbyhq.com/posting-api/job-board/<token>) — 13:
 #     openai 731 · modal 30 · baseten 70 · anyscale 16 · langchain 104 ·
-#     clickhouse 179 · supabase 55 · render 35 · cursor 114 · warp 16 ·
-#     railway 8 · pinecone 8 · docker 57
-#   Lever (api.lever.co/v0/postings/<token>?mode=json): shieldai 434
-#   Workable (apply.workable.com/api/v1/widget/accounts/<token>?details=true):
+#     pinecone 8 · clickhouse 179 · supabase 55 · render 35 · docker 57 ·
+#     cursor 114 · warp 16 · railway 8
+#   Lever (api.lever.co/v0/postings/<token>?mode=json) — 1: shieldai 434
+#   Workable (apply.workable.com/api/v1/widget/accounts/<token>?details=true) — 1:
 #     huggingface 7
 #
 # DROPPED after checking — every one of these looks plausible and is not a source:
