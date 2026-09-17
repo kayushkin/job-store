@@ -150,7 +150,7 @@ func minimalDOCX(t *testing.T, paragraphs ...string) []byte {
 
 func TestUploadExtractsDOCXTextAndKeepsTheOriginal(t *testing.T) {
 	s := openTestStore(t)
-	data := minimalDOCX(t, "Vlad Kayushkin", "Senior Backend Engineer", "Go, SQLite, Kubernetes")
+	data := minimalDOCX(t, "Slava Kayushkin", "Senior Backend Engineer", "Go, SQLite, Kubernetes")
 
 	doc, created, err := s.UploadDocument(Upload{
 		Name: "resume-docx", Kind: DocumentKindResume, Filename: "Resume.docx",
@@ -166,7 +166,7 @@ func TestUploadExtractsDOCXTextAndKeepsTheOriginal(t *testing.T) {
 	if doc.Format != DocumentFormatDOCX {
 		t.Errorf("format = %q, want %q", doc.Format, DocumentFormatDOCX)
 	}
-	for _, want := range []string{"Vlad Kayushkin", "Senior Backend Engineer", "Kubernetes"} {
+	for _, want := range []string{"Slava Kayushkin", "Senior Backend Engineer", "Kubernetes"} {
 		if !strings.Contains(doc.Body, want) {
 			t.Errorf("extracted body is missing %q; body = %q", want, doc.Body)
 		}
@@ -237,7 +237,7 @@ func minimalPDF(t *testing.T, lines ...string) []byte {
 
 func TestUploadExtractsPDFTextAndKeepsTheOriginal(t *testing.T) {
 	s := openTestStore(t)
-	data := minimalPDF(t, "VLAD KAYUSHKIN", "Staff Backend Engineer")
+	data := minimalPDF(t, "SLAVA KAYUSHKIN", "Staff Backend Engineer")
 
 	doc, _, err := s.UploadDocument(Upload{
 		Name: "resume-pdf", Kind: DocumentKindResume, Filename: "Resume.pdf",
@@ -249,7 +249,7 @@ func TestUploadExtractsPDFTextAndKeepsTheOriginal(t *testing.T) {
 	if doc.Format != DocumentFormatPDF {
 		t.Errorf("format = %q, want %q", doc.Format, DocumentFormatPDF)
 	}
-	for _, want := range []string{"VLAD KAYUSHKIN", "Staff Backend Engineer"} {
+	for _, want := range []string{"SLAVA KAYUSHKIN", "Staff Backend Engineer"} {
 		if !strings.Contains(doc.Body, want) {
 			t.Errorf("extracted body is missing %q; body = %q", want, doc.Body)
 		}
@@ -383,7 +383,7 @@ func TestUploadRejectsAFileOverTheSizeLimit(t *testing.T) {
 
 func TestUploadedTextKeepsItsBytesAsTheBody(t *testing.T) {
 	s := openTestStore(t)
-	body := "VLAD KAYUSHKIN\n\nEXPERIENCE\n  Staff Engineer      2020-2026\n"
+	body := "SLAVA KAYUSHKIN\n\nEXPERIENCE\n  Staff Engineer      2020-2026\n"
 	doc, _, err := s.UploadDocument(Upload{
 		Name: "resume-txt", Filename: "resume.txt", ContentType: "text/plain", Data: []byte(body),
 	})
@@ -403,7 +403,7 @@ func TestUploadedTextKeepsItsBytesAsTheBody(t *testing.T) {
 func TestDocumentFileServesTheOriginalAndTypedInDocumentsHaveNone(t *testing.T) {
 	srv, s := newTestServer(t)
 
-	data := minimalDOCX(t, "Vlad Kayushkin")
+	data := minimalDOCX(t, "Slava Kayushkin")
 	uploaded, _, err := s.UploadDocument(Upload{
 		Name: "resume-docx", Filename: "Resume.docx", ContentType: "application/docx", Data: data,
 	})
@@ -474,7 +474,7 @@ func TestUploadOverHTTPAcceptsMultipartAndReportsExtractionFailure(t *testing.T)
 		return resp
 	}
 
-	good := post(t, "resume-upload", "Resume.docx", minimalDOCX(t, "Vlad Kayushkin", "Staff Engineer"))
+	good := post(t, "resume-upload", "Resume.docx", minimalDOCX(t, "Slava Kayushkin", "Staff Engineer"))
 	defer good.Body.Close()
 	if good.StatusCode != http.StatusCreated {
 		t.Fatalf("status = %d, want 201", good.StatusCode)
@@ -483,7 +483,7 @@ func TestUploadOverHTTPAcceptsMultipartAndReportsExtractionFailure(t *testing.T)
 	if err := json.NewDecoder(good.Body).Decode(&doc); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if !strings.Contains(doc.Body, "Vlad Kayushkin") {
+	if !strings.Contains(doc.Body, "Slava Kayushkin") {
 		t.Errorf("body = %q, want the extracted text", doc.Body)
 	}
 
@@ -519,7 +519,7 @@ func TestRenderMarkdownProducesTheExpectedHTML(t *testing.T) {
 	doc := &Document{
 		Name:   "resume-general",
 		Format: DocumentFormatMarkdown,
-		Body: "# Vlad Kayushkin\n\n" +
+		Body: "# Slava Kayushkin\n\n" +
 			"Staff engineer with **fifteen years** of _backend_ experience.\n" +
 			"Reach me at [my site](https://kayushkin.com/about_me).\n\n" +
 			"## Experience\n\n" +
@@ -534,7 +534,7 @@ func TestRenderMarkdownProducesTheExpectedHTML(t *testing.T) {
 	for _, want := range []string{
 		"<!DOCTYPE html>",
 		"<title>resume-general</title>",
-		"<h1>Vlad Kayushkin</h1>",
+		"<h1>Slava Kayushkin</h1>",
 		"<h2>Experience</h2>",
 		"<strong>fifteen years</strong>",
 		"<em>backend</em>",
@@ -585,7 +585,7 @@ func TestRenderExtractedFormatsCarryABannerPointingAtTheOriginal(t *testing.T) {
 	for _, format := range []string{DocumentFormatPDF, DocumentFormatDOCX} {
 		doc := &Document{
 			ID: 7, Name: "resume-upload", Format: format, SourceFilename: "Resume.pdf",
-			Body: "VLAD KAYUSHKIN\n  Staff Engineer",
+			Body: "SLAVA KAYUSHKIN\n  Staff Engineer",
 		}
 		got := RenderDocument(doc)
 		if !strings.Contains(got, "/documents/7/file") {
