@@ -506,7 +506,7 @@ func TestUploadOverHTTPAcceptsMultipartAndReportsExtractionFailure(t *testing.T)
 
 	// A name of its own is required: falling back to the filename would let two
 	// resume.pdf uploads collide and silently overwrite each other.
-	nameless := post(t, "", "Resume.docx", minimalDOCX(t, "Vlad"))
+	nameless := post(t, "", "Resume.docx", minimalDOCX(t, "Slava"))
 	defer nameless.Body.Close()
 	if nameless.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d for an upload with no name, want 400", nameless.StatusCode)
@@ -571,7 +571,7 @@ func TestRenderEscapesUserContent(t *testing.T) {
 }
 
 func TestRenderHTMLBodyPassesThroughTheWrapperUnconverted(t *testing.T) {
-	body := `<h1>Vlad</h1><p class="lede">Already <b>markup</b>.</p>`
+	body := `<h1>Slava</h1><p class="lede">Already <b>markup</b>.</p>`
 	got := RenderDocument(&Document{Name: "resume-html", Format: DocumentFormatHTML, Body: body})
 	if !strings.Contains(got, body) {
 		t.Errorf("an html body was rewritten; want it passed through verbatim.\ngot: %s", got)
