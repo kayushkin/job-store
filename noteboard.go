@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	neturl "net/url"
-	"os"
 	"strings"
 	"time"
 )
@@ -18,9 +17,9 @@ import (
 // being down, and the HTTP layer answers 502 so it reads as one.
 var ErrNoteboard = errors.New("noteboard")
 
-// DefaultNoteboardURL is where noteboard listens. Overridable with NOTEBOARD_URL,
-// which is what a test injects to point the client at a stub — or at nothing, to
-// prove an unreachable noteboard is reported rather than swallowed.
+// DefaultNoteboardURL is where noteboard listens. It is the default of the
+// noteboard_url setting (NOTEBOARD_URL, declared in settings.go), which the
+// command hands to Store.SetNoteboardBaseURL.
 const DefaultNoteboardURL = "http://localhost:8191"
 
 // NoteboardClient reads and writes todos in noteboard, which owns them. job-store
@@ -31,16 +30,14 @@ type NoteboardClient struct {
 	HTTP    *http.Client
 }
 
-// NewNoteboardClient builds a client for baseURL, falling back to NOTEBOARD_URL
-// and then to DefaultNoteboardURL.
+// NewNoteboardClient builds a client for baseURL. An empty baseURL means
+// DefaultNoteboardURL. It reads no environment: NOTEBOARD_URL reaches it
+// through the settings registry and Store.SetNoteboardBaseURL.
 //
 // The timeout is short on purpose: expanding tasks happens inside a GET a person
 // is waiting on, and a noteboard that is not answering has to be reported
 // quickly rather than hold the request open.
 func NewNoteboardClient(baseURL string) *NoteboardClient {
-	if baseURL == "" {
-		baseURL = os.Getenv("NOTEBOARD_URL")
-	}
 	if baseURL == "" {
 		baseURL = DefaultNoteboardURL
 	}

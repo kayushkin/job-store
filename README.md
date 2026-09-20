@@ -35,6 +35,10 @@ JOB_STORE_ADDR=:8311 ./job-store  # or run it directly
 
 - `JOB_STORE_ADDR` — listen address, default `:8311`
 - `JOB_STORE_DATA_DIR` — default `~/.config/job-store`; holds `job-store.db` (WAL) and `blobs/`
+- `NOTEBOARD_URL` — where application tasks are read and created, default `http://localhost:8191`
+
+All three are declared in `settings.go` and described, with the values in force, at `GET /settings`.
+A set `JOB_STORE_` variable that is not declared there stops the service at boot.
 
 ## The shape of it
 

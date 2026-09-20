@@ -9,7 +9,9 @@ comes due on its own cadence, and everything a scout finds arrives as `proposed`
 to approve. Nothing self-approves.
 
 Module `github.com/kayushkin/job-store`, root package `jobstore`, binary `cmd/job-store`.
-Env: `JOB_STORE_ADDR` (default `:8311`), `JOB_STORE_DATA_DIR` (default `~/.config/job-store`).
+Env: `JOB_STORE_ADDR` (default `:8311`), `JOB_STORE_DATA_DIR` (default `~/.config/job-store`),
+`NOTEBOARD_URL` (default `http://localhost:8191`). `GET /settings` describes all three with the
+value in force and where it came from (llm-bridge `servicesettings`); nothing is writable.
 SQLite at `<data dir>/job-store.db`, WAL, `?_foreign_keys=on`.
 
 All timestamps are epoch seconds (`INTEGER`, 0 = unset). Arrays are JSON-encoded `TEXT`.
@@ -532,6 +534,7 @@ screen before you walk into an interview.
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/health` | `{"status":"ok"}` |
+| GET | `/settings` | every environment variable the service reads, with the value in force and its source (`servicesettings`); read-only |
 | GET | `/role-families` | `{"role_families":[{name,description}]}` in display order |
 | GET | `/listings` | `?status &company &role_family &source_id &remote &seniority &posted_from &posted_to &q &limit &include_deleted` → `{"listings":[…]}` |
 | POST | `/listings` | upsert by sig; accepts `posted`/`closes` ISO strings alongside the epoch fields; 201 create / 200 update |

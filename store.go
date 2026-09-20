@@ -64,9 +64,10 @@ type Store struct {
 }
 
 // SetNoteboardBaseURL points this store's task reads and creates at another
-// noteboard. It exists so a test can aim the store at a stub — or at an address
-// nothing answers on, to prove an unreachable noteboard is reported rather than
-// read as "no outstanding tasks".
+// noteboard. The command calls it with the noteboard_url setting; a test calls
+// it to aim the store at a stub — or at an address nothing answers on, to prove
+// an unreachable noteboard is reported rather than read as "no outstanding
+// tasks".
 func (s *Store) SetNoteboardBaseURL(baseURL string) {
 	s.noteboard = NewNoteboardClient(baseURL)
 }

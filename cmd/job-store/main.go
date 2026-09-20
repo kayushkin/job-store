@@ -10,23 +10,26 @@ import (
 	"time"
 
 	jobstore "github.com/kayushkin/job-store"
+	"github.com/kayushkin/llm-bridge/servicesettings"
 )
 
 func main() {
-	addr := os.Getenv("JOB_STORE_ADDR")
-	if addr == "" {
-		addr = ":8311"
+	settings, err := jobstore.NewSettingsRegistry(servicesettings.ProcessEnvironment())
+	if err != nil {
+		log.Fatalf("read settings: %v", err)
 	}
-	dataDir := os.Getenv("JOB_STORE_DATA_DIR")
+	addr := settings.String(jobstore.SettingListenAddress)
 
-	store, err := jobstore.Open(dataDir)
+	store, err := jobstore.Open(settings.String(jobstore.SettingDataDirectory))
 	if err != nil {
 		log.Fatalf("open store: %v", err)
 	}
 	defer store.Close()
+	store.SetNoteboardBaseURL(settings.String(jobstore.SettingNoteboardURL))
 
 	mux := http.NewServeMux()
 	jobstore.RegisterHandlers(mux, store)
+	jobstore.RegisterSettingsHandler(mux, settings)
 
 	srv := &http.Server{
 		Addr:              addr,
