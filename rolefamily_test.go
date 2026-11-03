@@ -206,7 +206,7 @@ func TestNormalizeListingRoleFamilyLeavesTheCanonicalNameOutOfTags(t *testing.T)
 func TestEmptyRoleFamilyIsAllowedButNonsenseIsNot(t *testing.T) {
 	unsorted := &Listing{RoleFamily: ""}
 	if err := NormalizeListingRoleFamily(unsorted); err != nil {
-		t.Errorf("an unlabelled listing must be kept, got %v", err)
+		t.Errorf("an unlabeled listing must be kept, got %v", err)
 	}
 	if unsorted.RoleFamily != "" {
 		t.Errorf("role family = %q, want it left empty for Unsorted", unsorted.RoleFamily)

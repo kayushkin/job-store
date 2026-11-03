@@ -482,7 +482,7 @@ func NormalizeRoleFamily(raw string) (string, bool) {
 // information and the specific word stays searchable.
 //
 // An empty family is left empty rather than rejected: a real posting that arrives
-// unlabelled is still worth keeping, and the UI collects these under "Unsorted"
+// unlabeled is still worth keeping, and the UI collects these under "Unsorted"
 // where they can be sorted by hand. A non-empty label that means nothing is a
 // different thing — that is a mistake, and it is rejected.
 func NormalizeListingRoleFamily(l *Listing) error {

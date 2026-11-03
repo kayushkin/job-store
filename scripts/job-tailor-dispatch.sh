@@ -177,7 +177,7 @@ print(request["document_id"], request["listing_id"])
     failures=$((failures + 1))
     continue
   fi
-  instructions=$(printf '%s' "$request" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("instructions") or "(none — use your judgement)")')
+  instructions=$(printf '%s' "$request" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("instructions") or "(none — use your judgment)")')
 
   # Claim it before doing any work, so the UI stops showing it as queued and a
   # second dispatcher tick cannot pick up the same row.
